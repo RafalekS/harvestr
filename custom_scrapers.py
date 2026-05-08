@@ -2516,37 +2516,41 @@ class CamSmut(SiteScraper):
             entry_count=len(unique),
         )
 
-    @staticmethod
-    def _deobfuscate_path(href: str) -> tuple[str, str]:
-        """Undo camsmut's client-side URL obfuscation.
+    # Real video hashes on camsmut.com are 7 characters. Listing pages append
+    # 1-2 random decoy chars to defeat naive scrapers — the count varies per
+    # render. The first 7 chars are always the canonical hash.
+    _CANONICAL_HASH_LEN = 7
 
-        CamSmut injects an extra character into video-hash URLs in the HTML,
-        and the site's `pointerover` JS event strips it back out before
-        navigation. Scripts without a real browser see 404 unless they
-        apply the same transform.
+    @classmethod
+    def _deobfuscate_path(cls, href: str) -> tuple[str, str]:
+        """Undo camsmut's anti-scraper hash obfuscation.
 
-        JS (from the site):
-            let h=e.getAttribute("href");
-            if (!h.startsWith("/")) return;
-            var x=h.substring(7).indexOf("/");
-            e.setAttribute("href", h.substring(0, 6+x) + h.substring(7+x));
+        camsmut.com appends 1-2 random decoy characters to every video
+        hash on listing pages. The server only accepts the canonical
+        7-char hash for /video/<hash>/<slug> requests. The original JS
+        used to drop exactly one char (the obfuscation was 1-char), but
+        as of May 2026 the site rotates 1-2 chars and the only safe
+        approach is to truncate to the first 7 chars.
 
-        i.e. drop exactly ONE character at position (6 + position-of-first-'/'
-        in the slice starting at 7). For a URL like /video/mg55po24/slug,
-        this removes the LAST char of the 8-char hash → /video/mg55po2/slug.
+        Empirically verified May 2026:
+          - 9-char `qjk17l88p`/`qjk17l8o1`/`qjk17l8cp` → all 404
+          - 8-char `qjk17l88`/`mgvp97vj` → 404
+          - 7-char `qjk17l8`/`mgvp97v` → 200 OK with player iframe
 
-        Returns (clean_href, clean_hash).
-        """
-        if not href.startswith("/"):
+        Returns (clean_href, clean_hash). Empty hash means the input
+        wasn't a /video/<hash>/<slug> URL we recognized."""
+        if not href.startswith("/video/"):
             return href, ""
-        suffix = href[7:]
-        x = suffix.find("/")
-        if x < 0:
+        # /video/<hash>/<slug> — split out the hash, truncate, reassemble
+        m = re.match(r"^(/video/)([a-z0-9]+)(/.*)$", href, re.IGNORECASE)
+        if not m:
             return href, ""
-        clean = href[:6 + x] + href[7 + x:]
-        # Extract hash from /video/<hash>/<slug>
-        m = re.match(r"^/video/([a-z0-9]+)/", clean, re.IGNORECASE)
-        return clean, (m.group(1) if m else "")
+        prefix, raw_hash, suffix = m.group(1), m.group(2), m.group(3)
+        if len(raw_hash) < cls._CANONICAL_HASH_LEN:
+            # Already shorter than canonical (rare) — pass through unchanged
+            return href, raw_hash
+        clean_hash = raw_hash[:cls._CANONICAL_HASH_LEN]
+        return prefix + clean_hash + suffix, clean_hash
 
     def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
         self._ensure_auth()
