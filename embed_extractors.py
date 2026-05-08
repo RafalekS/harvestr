@@ -412,6 +412,55 @@ _PW_CTX = None   # module-level browser context, reused across calls
 _PW_PLAYWRIGHT = None
 
 
+# Comprehensive stealth init script — hides automation tells beyond
+# `navigator.webdriver`. Cloudflare Turnstile fingerprints navigator.*,
+# WebGL, plugins, and chrome.runtime; our previous one-liner only
+# covered .webdriver, which means Turnstile was still flagging the
+# session as automation. This expanded script covers all the common
+# detection vectors.
+_STEALTH_INIT_SCRIPT = r"""
+(() => {
+    'use strict';
+    try { Object.defineProperty(Navigator.prototype, 'webdriver', { get: () => undefined, configurable: true }); } catch (e) {}
+    try {
+        const fakePlugins = [
+            { name: 'PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chrome PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Chromium PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'Microsoft Edge PDF Viewer', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+            { name: 'WebKit built-in PDF', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+        ];
+        Object.defineProperty(Navigator.prototype, 'plugins', {
+            get: () => Object.assign(fakePlugins, { length: fakePlugins.length, item: i => fakePlugins[i], namedItem: n => fakePlugins.find(p => p.name === n) || null, refresh: () => {} }),
+            configurable: true,
+        });
+    } catch (e) {}
+    try { Object.defineProperty(Navigator.prototype, 'languages', { get: () => ['en-US', 'en'], configurable: true }); } catch (e) {}
+    try {
+        if (!window.chrome) window.chrome = {};
+        if (!window.chrome.runtime) window.chrome.runtime = {};
+        if (!window.chrome.app) window.chrome.app = { isInstalled: false };
+    } catch (e) {}
+    try {
+        const origQuery = navigator.permissions.query.bind(navigator.permissions);
+        navigator.permissions.query = (params) => (
+            params && params.name === 'notifications'
+                ? Promise.resolve({ state: 'default', onchange: null })
+                : origQuery(params)
+        );
+    } catch (e) {}
+    try {
+        const orig = WebGLRenderingContext.prototype.getParameter;
+        WebGLRenderingContext.prototype.getParameter = function (p) {
+            if (p === 37445) return 'Intel Inc.';
+            if (p === 37446) return 'Intel Iris OpenGL Engine';
+            return orig.call(this, p);
+        };
+    } catch (e) {}
+})();
+"""
+
+
 def _ensure_playwright(log: Optional[logging.Logger] = None):
     """Lazy-init a headless-Chromium context. Returns (playwright, context)
     or (None, None) if Playwright isn't installed / fails to launch."""
@@ -435,17 +484,24 @@ def _ensure_playwright(log: Optional[logging.Logger] = None):
                 "--disable-blink-features=AutomationControlled",
                 "--disable-dev-shm-usage",
                 "--no-sandbox",
+                # Reduce detection surface: Cloudflare's bot-score uses
+                # subresource integrity + automation-flag checks; these
+                # args turn off the most-fingerprintable defaults.
+                "--disable-features=IsolateOrigins,site-per-process",
+                "--disable-site-isolation-trials",
             ],
         )
         ctx = browser.new_context(
             user_agent=USER_AGENT,
             viewport={"width": 1280, "height": 800},
             locale="en-US",
+            # Mimic a real Chrome timezone (most automation tools leak UTC)
+            timezone_id="America/New_York",
         )
-        # Stealth: remove navigator.webdriver
-        ctx.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        # Comprehensive stealth — replaces the previous 1-line webdriver
+        # hide with a full fingerprint mask covering plugins, languages,
+        # chrome.runtime, permissions, and WebGL vendor.
+        ctx.add_init_script(_STEALTH_INIT_SCRIPT)
         _PW_PLAYWRIGHT = pw
         _PW_CTX = ctx
         _PW_AVAILABLE = True
@@ -455,6 +511,48 @@ def _ensure_playwright(log: Optional[logging.Logger] = None):
         if log:
             log.warning(f"  Playwright launch failed: {e}")
         return None, None
+
+
+def _click_turnstile_real_mouse(page, log: Optional[logging.Logger] = None) -> bool:
+    """Click the Cloudflare Turnstile checkbox using REAL Playwright mouse
+    events (not synthetic JS). Cloudflare's Turnstile widget specifically
+    checks `event.isTrusted` — synthetic JS clicks (`element.click()`,
+    `dispatchEvent(new MouseEvent('click'))`) all have isTrusted=false
+    and are rejected. Playwright's page.mouse.click() generates a trusted
+    event via CDP that Turnstile accepts.
+
+    Returns True if a click was issued. False if no Turnstile iframe was
+    visible — caller should retry on a later poll."""
+    import random
+    try:
+        cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first
+        if cf_iframe.count() == 0:
+            return False
+        try:
+            cf_iframe.wait_for(state="visible", timeout=3000)
+        except Exception:
+            pass
+        box = cf_iframe.bounding_box()
+        if not box or box.get("width", 0) < 50:
+            return False
+        # Checkbox is at the LEFT side of the Turnstile widget (~30px in,
+        # vertical center). Approach with intermediate mouse moves to
+        # mimic human cursor movement (instant teleport-to-target is a
+        # bot tell that Cloudflare's score model penalizes).
+        target_x = box["x"] + 30
+        target_y = box["y"] + box["height"] / 2
+        page.mouse.move(target_x - 200, target_y - 80, steps=8)
+        page.mouse.move(target_x - 50, target_y - 20, steps=10)
+        page.mouse.move(target_x, target_y, steps=8)
+        page.wait_for_timeout(300 + random.randint(120, 400))
+        page.mouse.click(target_x, target_y, delay=random.randint(40, 110))
+        if log:
+            log.debug(f"  Turnstile: clicked iframe at ({target_x:.0f},{target_y:.0f})")
+        return True
+    except Exception as e:
+        if log:
+            log.debug(f"  Turnstile click failed: {type(e).__name__}: {e}")
+        return False
 
 
 def shutdown_playwright() -> None:
@@ -513,6 +611,25 @@ def extract_via_playwright(url: str,
         page.on("request", on_req)
         page.goto(resolved, wait_until="domcontentloaded", timeout=30000)
         _pw_wait_cf(page, timeout=45)
+        # If a Cloudflare Turnstile widget is rendered, click it via real
+        # mouse events. Wait 8s first to give "auto" mode a chance to
+        # self-resolve; then click and wait. Re-attempt every 12s up to
+        # ~50s total (matches our standalone timing budget).
+        try:
+            page.wait_for_timeout(8000)
+            for _ in range(4):
+                if intercepted.get("stream"):
+                    break
+                turnstile_present = bool(page.locator(
+                    'iframe[src*="challenges.cloudflare.com"]'
+                ).count())
+                if not turnstile_present:
+                    break
+                clicked = _click_turnstile_real_mouse(page, log=log)
+                page.wait_for_timeout(12000 if clicked else 4000)
+        except Exception as e:
+            if log:
+                log.debug(f"  Turnstile bypass attempt: {type(e).__name__}: {e}")
         page.wait_for_timeout(5000)
 
         stream = intercepted.get("stream")
