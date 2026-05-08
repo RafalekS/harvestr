@@ -343,6 +343,11 @@ def load_sites_detailed() -> list[dict]:
         # New (May 2026): cam-rip aggregators + erome album host
         "showcamrips": "cam", "webcamsrips": "cam",
         "erome": "adult",
+        # New (May 2026 round 2): theporndude top-tier additions
+        "pornhat": "adult", "okxxx": "adult",
+        "porndoe": "adult", "hqporner": "adult",
+        # New yt-dlp-supported sites in sites.json
+        "txxx": "adult", "youjizz": "adult",
     }
 
     out: list[dict] = []

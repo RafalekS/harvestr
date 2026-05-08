@@ -271,6 +271,26 @@
       "yt_dlp_extractor": "generic",
       "supports_flat": true,
       "notes": "No dedicated yt-dlp extractor; relies on generic scraping. Only /models/ used (search/tags return unrelated videos)."
+    },
+    "txxx": {
+      "category": "adult",
+      "patterns": [
+        "https://txxx.com/pornstars/{u}/",
+        "https://txxx.com/channels/{u}/"
+      ],
+      "yt_dlp_extractor": "txxx",
+      "supports_flat": true,
+      "notes": "Large general-purpose tube. yt-dlp's TxxxIE handles both extraction and listing."
+    },
+    "youjizz": {
+      "category": "adult",
+      "patterns": [
+        "https://www.youjizz.com/profile/{u}.html",
+        "https://www.youjizz.com/pornstars/{u}.html"
+      ],
+      "yt_dlp_extractor": "youjizz",
+      "supports_flat": true,
+      "notes": "Old-school tube; supports both /profile/ and /pornstars/ URL forms."
     }
   }
 }

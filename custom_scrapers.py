@@ -3627,6 +3627,619 @@ class WebCamsRips(SiteScraper):
             video.title = f"webcamsrips-{video.video_id}"
 
 
+# ── DirectSourceTagScraper — base for sites with <source src=*.mp4> ──────
+# Several mainstream tube sites (pornhat.com, ok.xxx, and similar) emit
+# the player markup as plain HTML5 <video><source src="..."></video> with
+# multiple quality variants. No KVS flashvars, no JS player init — the
+# stream URLs are right there in the page. Much simpler than KVS.
+#
+# Subclasses just configure PROFILE_PATTERNS, VIDEO_LINK_RE, and (if needed)
+# the host-specific quality-suffix extraction. extract_stream picks the
+# highest-quality variant and HEAD-validates it.
+class DirectSourceTagScraper(SiteScraper):
+    """Scraper for tube sites that expose mp4 URLs in plain <source> tags."""
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    AUTHORITATIVE_USER = True   # /models/X is the user's own page
+
+    # Subclass overrides
+    PROFILE_PATTERNS: List[str] = []
+    VIDEO_LINK_RE = re.compile(r'href="(/video/([a-z0-9-]+)/)"')
+    SOURCE_RE = re.compile(r'<source[^>]*src="([^"]+\.mp4[^"]*)"', re.IGNORECASE)
+    OGTITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"')
+    PAGETITLE_RE = re.compile(r'<title>([^<|]+?)(?:\s*[\|—-].*)?</title>', re.IGNORECASE)
+
+    # Quality preference order — higher score = preferred
+    _QUALITY_ORDER = (
+        ("2160p", 6), ("1440p", 5), ("1080p", 4), ("720p", 3),
+        ("480p", 2), ("360p", 1), ("240p", 0),
+    )
+
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4
+
+    def _fetch(self, url: str, *, referer: str = "",
+                retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def _profile_url(self, username: str) -> str:
+        for pat in self.PROFILE_PATTERNS:
+            return pat.format(base=self.BASE_URL.rstrip("/"), u=username)
+        return ""
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        for pat in self.PROFILE_PATTERNS:
+            url = pat.format(base=self.BASE_URL.rstrip("/"), u=username)
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                continue
+            if _looks_like_soft_404(r.text):
+                continue
+            ids = {vid for _, vid in self.VIDEO_LINK_RE.findall(r.text)}
+            if not ids:
+                continue
+            return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+        return None
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            url = hit.url if page == 1 else self._listing_url(hit.url, page)
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for path, vid in self.VIDEO_LINK_RE.findall(r.text):
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                new += 1
+                full_url = path if path.startswith("http") else self.BASE_URL.rstrip("/") + path
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=vid,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _listing_url(self, base_profile_url: str, page: int) -> str:
+        sep = "&" if "?" in base_profile_url else "?"
+        return f"{base_profile_url.rstrip('/')}/{sep}page={page}"
+
+    def _quality_score(self, url: str) -> int:
+        for marker, score in self._QUALITY_ORDER:
+            if marker in url:
+                return score
+        # No quality marker = likely the canonical/full-quality stream
+        return 100  # higher than any explicit quality
+
+    def _pick_best_source(self, sources: List[str]) -> str:
+        """Return the highest-quality mp4 URL. PornHat/ok.xxx publish
+        multiple variants (360p/720p/no-suffix). Prefer no-suffix
+        (canonical), then 1080p > 720p > 480p > 360p."""
+        if not sources:
+            return ""
+        ranked = sorted(set(sources), key=self._quality_score, reverse=True)
+        return ranked[0]
+
+    def _extract_title(self, html: str) -> str:
+        for pat in (self.OGTITLE_RE, self.PAGETITLE_RE):
+            m = pat.search(html)
+            if m:
+                t = _html.unescape(m.group(1)).strip()
+                if t and len(t) > 2:
+                    return t
+        return ""
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        r = self._fetch(video.video_url)
+        if r is None or r.status_code != 200:
+            return False
+        if _looks_like_soft_404(r.text):
+            return False
+        sources = self.SOURCE_RE.findall(r.text)
+        if not sources:
+            self.log.debug(f"  [{self.NAME}] no <source> tags in {video.video_url}")
+            return False
+        chosen = self._pick_best_source([_html.unescape(s) for s in sources])
+        if not chosen:
+            return False
+        headers = {"Referer": video.video_url, "User-Agent": USER_AGENT}
+        if not _validate_stream_url(chosen, headers=headers, log=self.log):
+            self.log.debug(f"  [{self.NAME}] mp4 failed HEAD: {chosen[:80]}")
+            return False
+        video.stream_url = chosen
+        video.stream_kind = "mp4"
+        video.stream_headers = headers
+        title = self._extract_title(r.text)
+        if title:
+            video.title = title
+        elif not video.title:
+            video.title = f"{self.NAME}-{video.video_id}"
+        return True
+
+
+# ── PornHat (direct-source mainstream tube) ──────────────────────────────
+# Profile:    https://pornhat.com/models/{u}/      (paginated ?page=N)
+# Video page: /video/{slug}/                       (slug is canonical id)
+# Stream:     <source src="https://www.pornhat.com/get_file/13/...mp4">
+#             plus 3-4 quality variants per page (360p / 720p / no-suffix).
+#
+# Tested mia-malkova → 60 videos page 1; <source> URLs validated 200/206.
+class PornHat(DirectSourceTagScraper):
+    NAME = "pornhat"
+    BASE_URL = "https://pornhat.com"
+    PROFILE_PATTERNS = ["{base}/models/{u}/", "{base}/channels/{u}/"]
+    VIDEO_LINK_RE = re.compile(
+        r'href="((?:https?://(?:www\.)?pornhat\.com)?/video/([a-z0-9-]+)/)"',
+        re.IGNORECASE,
+    )
+    SOURCE_RE = re.compile(
+        r'<source[^>]*src="(https?://(?:www\.)?pornhat\.com/get_file/[^"]+\.mp4[^"]*)"',
+        re.IGNORECASE,
+    )
+
+
+# ── OK.XXX (direct-source mainstream tube) ───────────────────────────────
+# Sister site to PornHat — same engine, different URL pattern (numeric id).
+# Profile:    https://ok.xxx/models/{u}/
+# Video page: /video/{numeric}/
+# Stream:     <source src="https://ok.xxx/get_file/13/...mp4">
+class OkXxx(DirectSourceTagScraper):
+    NAME = "okxxx"
+    BASE_URL = "https://ok.xxx"
+    PROFILE_PATTERNS = ["{base}/models/{u}/", "{base}/channels/{u}/"]
+    VIDEO_LINK_RE = re.compile(
+        r'href="((?:https?://(?:www\.)?ok\.xxx)?/video/(\d+)/)"',
+        re.IGNORECASE,
+    )
+    SOURCE_RE = re.compile(
+        r'<source[^>]*src="(https?://(?:www\.)?ok\.xxx/get_file/[^"]+\.mp4[^"]*)"',
+        re.IGNORECASE,
+    )
+
+
+# ── PornDoe (direct-mp4, no KVS) ─────────────────────────────────────────
+# Profile:    https://www.porndoe.com/pornstars-profile/{name}        (paginated /page/N)
+# Video page: https://www.porndoe.com/watch/{hash}                    (e.g. pd0c0i1i1v9o)
+# Stream:     mp4 URLs are inline on the video page at p.cdnc.porndoe.com.
+#
+# Enterprise traits:
+#   - Retries with exponential backoff (transient 5xx + connection errors)
+#   - Soft-404 detection (PornDoe shows a search-suggestion page on miss)
+#   - Multi-pattern source extraction (mp4 host varies: p.cdnc.porndoe.com,
+#     and occasionally an embedded HLS .m3u8 for newer uploads)
+#   - HEAD-validated stream URLs before commit
+#   - Multi-strategy title extraction (og:title, page title, h1)
+#
+# Tested against mia-malkova: 24 unique /watch/ links from page 1.
+class PornDoe(SiteScraper):
+    NAME = "porndoe"
+    BASE_URL = "https://www.porndoe.com"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    PROFILE_PATTERNS = ["{base}/pornstars-profile/{u}"]
+    AUTHORITATIVE_USER = True
+
+    # Hrefs are relative on listing pages; match both forms
+    VIDEO_LINK_RE = re.compile(
+        r'href="((?:https?://(?:www\.)?porndoe\.com)?/watch/([a-z0-9]+))"', re.IGNORECASE,
+    )
+    # Stream URL strategies, in priority order
+    STREAM_RES = (
+        re.compile(r'<source[^>]*src="(https?://[^"]+\.(?:mp4|m3u8)[^"]*)"', re.IGNORECASE),
+        re.compile(r'(?:file|src)\s*[:=]\s*["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']', re.IGNORECASE),
+        re.compile(r'(https?://p\.cdnc\.porndoe\.com/[^\s"\'<>]+\.mp4)', re.IGNORECASE),
+        re.compile(r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)', re.IGNORECASE),
+        re.compile(r'(https?://[^\s"\'<>]+\.mp4)', re.IGNORECASE),
+    )
+    OGTITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"')
+    PAGETITLE_RE = re.compile(r'<title>([^<|]+?)(?:\s*[\|—-].*)?</title>', re.IGNORECASE)
+    H1_RE = re.compile(r'<h1[^>]*>([^<]+)</h1>', re.IGNORECASE)
+
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4
+
+    def _fetch(self, url: str, *, referer: str = "",
+                retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        url = f"{self.BASE_URL}/pornstars-profile/{username}"
+        r = self._fetch(url)
+        if r is None or r.status_code != 200:
+            return None
+        if _looks_like_soft_404(r.text):
+            return None
+        ids = {vid for _, vid in self.VIDEO_LINK_RE.findall(r.text)}
+        if not ids:
+            return None
+        return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            url = hit.url if page == 1 else f"{hit.url}/page/{page}"
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for path, vid in self.VIDEO_LINK_RE.findall(r.text):
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                new += 1
+                # Hrefs are relative on listing pages — normalize to absolute
+                full_url = path if path.startswith("http") else self.BASE_URL.rstrip("/") + path
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=vid,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _extract_stream_url(self, html: str) -> Optional[Tuple[str, str]]:
+        """Return (stream_url, kind) on success; None on miss."""
+        seen: set = set()
+        for rex in self.STREAM_RES:
+            for m in rex.findall(html):
+                u = _html.unescape(m).strip()
+                if u and u not in seen:
+                    seen.add(u)
+                    kind = "hls" if ".m3u8" in u else "mp4"
+                    return u, kind
+        return None
+
+    def _extract_title(self, html: str) -> str:
+        for pat in (self.OGTITLE_RE, self.PAGETITLE_RE, self.H1_RE):
+            m = pat.search(html)
+            if m:
+                t = _html.unescape(m.group(1)).strip()
+                if t and t.lower() not in ("porndoe", "porndoe.com"):
+                    return t
+        return ""
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        r = self._fetch(video.video_url, referer=self.BASE_URL + "/")
+        if r is None or r.status_code != 200:
+            return False
+        if _looks_like_soft_404(r.text):
+            self.log.debug(f"  [{self.NAME}] soft-404 on {video.video_url}")
+            return False
+        result = self._extract_stream_url(r.text)
+        if not result:
+            self.log.debug(f"  [{self.NAME}] no stream URL in {video.video_url}")
+            return False
+        stream_url, kind = result
+        headers = {"Referer": video.video_url, "User-Agent": USER_AGENT}
+        # m3u8 master playlists often reject HEAD; only validate static mp4.
+        if kind == "mp4" and not _validate_stream_url(stream_url, headers=headers, log=self.log):
+            self.log.debug(f"  [{self.NAME}] mp4 failed HEAD: {stream_url[:80]}")
+            return False
+        video.stream_url = stream_url
+        video.stream_kind = kind
+        video.stream_headers = headers
+        title = self._extract_title(r.text)
+        if title:
+            video.title = title
+        elif not video.title:
+            video.title = f"porndoe-{video.video_id}"
+        return True
+
+
+# ── HQPorner (third-party iframe embed: mydaddy.cc & friends) ────────────
+# Profile:    https://hqporner.com/actress/{name}                 (paginated /page/N)
+# Video page: https://hqporner.com/hdporn/{id}-{slug}.html        (single iframe)
+# Embed:      <iframe src="//mydaddy.cc/video/{id}/">             (host rotates)
+#
+# Enterprise traits:
+#   - Three-tier embed extraction:
+#       Tier 1: shared embed_extractors.extract_embed_stream (handles
+#               many DoodStream-derivative hosts — mydaddy.cc, etc.)
+#       Tier 2: direct HTML scrape of the embed iframe page for raw
+#               mp4/m3u8 URLs (works for simple hosts)
+#       Tier 3: parent-page leak detection (some embeds expose source
+#               URLs in parent's data-* attrs)
+#   - Retries with backoff
+#   - Soft-404 detection
+#   - Multi-strategy title extraction
+#
+# Tested against mia-malkova: 50 unique /hdporn/ links from page 1.
+class HQPorner(SiteScraper):
+    NAME = "hqporner"
+    BASE_URL = "https://hqporner.com"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    PROFILE_PATTERNS = ["{base}/actress/{u}"]
+    AUTHORITATIVE_USER = True
+
+    VIDEO_LINK_RE = re.compile(
+        r'href="(/hdporn/(\d+)-[^"]+\.html)"', re.IGNORECASE,
+    )
+    IFRAME_RE = re.compile(r'<iframe[^>]*src="([^"]+)"', re.IGNORECASE)
+    OGTITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"')
+    PAGETITLE_RE = re.compile(r'<title>([^<|]+?)(?:\s*[\|—-].*)?</title>', re.IGNORECASE)
+
+    # Iframes we know to skip (ad/analytics)
+    _AD_HOST_FRAGMENTS = (
+        "ads.exoclick", "googletag", "doubleclick", "googlesyndication",
+        "google-analytics", "googletagmanager", "amazon-adsystem",
+        "trafficjunky", "rtmark", "exosrv", "popcash", "adsterra",
+        "mgid.com", "exo.tag",
+    )
+
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4
+
+    def _fetch(self, url: str, *, referer: str = "",
+                retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        # HQPorner uses dashes in actress names; normalize "Mia Malkova" → "mia-malkova"
+        slug = username.lower().replace("_", "-").replace(" ", "-")
+        url = f"{self.BASE_URL}/actress/{slug}"
+        r = self._fetch(url)
+        if r is None or r.status_code != 200:
+            return None
+        if _looks_like_soft_404(r.text):
+            return None
+        # HQPorner has a NASTY soft-404: invalid actress names render a generic
+        # listing of UNRELATED videos with the typed name reflected in title
+        # ("Zzz Not Real Actress Xyz Porn HD Videos for Free" — same shape as
+        # a real actress page). The video slugs for an invalid name are random
+        # and don't contain the queried name; for a real actress, many slugs
+        # embed the actress name (e.g. "...Mia_Malkova...").
+        # Use that as the discriminator.
+        matches = self.VIDEO_LINK_RE.findall(r.text)
+        ids = {vid for _, vid in matches}
+        if not ids:
+            return None
+        # Tokenize: split the username on '-'/'_'/' ' and check at least ONE
+        # video href contains any meaningful token (≥4 chars, to avoid stop
+        # words). Real actresses have multiple matches; fake names hit zero.
+        u_tokens = [t for t in re.split(r'[-_\s]+', username.lower()) if len(t) >= 4]
+        if u_tokens:
+            confirmations = 0
+            for path, _ in matches:
+                pl = path.lower()
+                if any(tok in pl for tok in u_tokens):
+                    confirmations += 1
+                    if confirmations >= 2:
+                        break
+            if confirmations < 2:
+                self.log.debug(
+                    f"  [{self.NAME}] soft-404 heuristic: 0 video slugs "
+                    f"contain any of {u_tokens} — probably not a real actress"
+                )
+                return None
+        return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            # HQPorner uses ?p=N for pagination
+            url = hit.url if page == 1 else f"{hit.url}?p={page}"
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for path, vid in self.VIDEO_LINK_RE.findall(r.text):
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                new += 1
+                full_url = path if path.startswith("http") else self.BASE_URL + path
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=vid,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _normalize_iframe(self, src: str) -> str:
+        src = _html.unescape(src).strip()
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = self.BASE_URL.rstrip("/") + src
+        return src
+
+    def _is_ad_iframe(self, src: str) -> bool:
+        s = src.lower()
+        return any(frag in s for frag in self._AD_HOST_FRAGMENTS)
+
+    def _pick_player_iframe(self, html: str) -> Optional[str]:
+        for raw in self.IFRAME_RE.findall(html):
+            src = self._normalize_iframe(raw)
+            if not src or self._is_ad_iframe(src):
+                continue
+            return src
+        return None
+
+    def _validate_or_pass(self, url: str, headers: Dict[str, str]) -> bool:
+        # HLS master playlists often reject HEAD — let ffmpeg surface real failures.
+        if ".m3u8" in url.lower():
+            return True
+        return _validate_stream_url(url, headers=headers, log=self.log)
+
+    def _set_title(self, video: VideoRef, html: str) -> None:
+        for pat in (self.OGTITLE_RE, self.PAGETITLE_RE):
+            m = pat.search(html)
+            if m:
+                t = _html.unescape(m.group(1)).strip()
+                if t and t.lower() not in ("hqporner", "hqporner.com"):
+                    video.title = t
+                    return
+        if not video.title:
+            video.title = f"hqporner-{video.video_id}"
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        r = self._fetch(video.video_url)
+        if r is None or r.status_code != 200:
+            return False
+        if _looks_like_soft_404(r.text):
+            return False
+        iframe_url = self._pick_player_iframe(r.text)
+        if not iframe_url:
+            self.log.debug(f"  [{self.NAME}] no player iframe in {video.video_url}")
+            return False
+
+        # Tier 1: shared embed extractor — runs host-specific (dood/voe/
+        # mixdrop/filemoon) → yt-dlp generic → Playwright headless. The
+        # mydaddy.cc embed (and most HQPorner third-party hosts) is JS-
+        # rendered with only ~180 bytes of static HTML, so allow_browser=True
+        # is REQUIRED here — Playwright executes the JS and intercepts the
+        # final stream URL from the player's network requests.
+        try:
+            from embed_extractors import extract_embed_stream  # type: ignore
+        except Exception:
+            extract_embed_stream = None  # type: ignore
+
+        if extract_embed_stream is not None:
+            try:
+                res = extract_embed_stream(iframe_url, self.log, allow_browser=True)
+            except Exception as e:
+                self.log.debug(f"  [{self.NAME}] tier1: {type(e).__name__}: {e}")
+                res = None
+            if res and getattr(res, "stream_url", ""):
+                stream_url = res.stream_url
+                stream_kind = (getattr(res, "kind", "") or
+                               ("hls" if ".m3u8" in stream_url else "mp4"))
+                headers = dict(getattr(res, "headers", {}) or {})
+                headers.setdefault("Referer", iframe_url)
+                headers.setdefault("User-Agent", USER_AGENT)
+                if self._validate_or_pass(stream_url, headers):
+                    video.stream_url = stream_url
+                    video.stream_kind = stream_kind
+                    video.stream_headers = headers
+                    self._set_title(video, r.text)
+                    return True
+
+        # Tier 2: direct embed-page scrape with hotlink Referer.
+        # Many HQPorner embed hosts (mydaddy.cc, similar) return only ~180
+        # bytes WITHOUT a Referer header (anti-hotlink), but full markup
+        # WITH the parent page Referer. The full markup contains <source>
+        # tags pointing at protocol-relative CDN URLs like
+        # //s86.bigcdn.cc/pubs/<hash>/{360,720,1080}.mp4 — multiple quality
+        # variants. Pick the highest quality.
+        re_ifr = self._fetch(iframe_url, referer=video.video_url)
+        if re_ifr is not None and re_ifr.status_code == 200 and len(re_ifr.text) > 1000:
+            # Collect all mp4/m3u8 URLs, accepting both absolute and
+            # protocol-relative (// prefix) forms.
+            all_streams: List[str] = []
+            for pat in (
+                # JWPlayer-style file: "..." config
+                r'(?:file|src)\s*[:=]\s*["\']((?:https?:)?//[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
+                # <source src="..."> tag
+                r'<source[^>]*src="((?:https?:)?//[^"]+\.(?:m3u8|mp4)[^"]*)"',
+                # Plain URL anywhere — fall-through
+                r'((?:https?:)?//[^\s"\'<>]+\.(?:m3u8|mp4))',
+            ):
+                for m in re.findall(pat, re_ifr.text, re.IGNORECASE):
+                    u = _html.unescape(m).strip()
+                    # Normalize protocol-relative URLs
+                    if u.startswith("//"):
+                        u = "https:" + u
+                    if u and u not in all_streams:
+                        all_streams.append(u)
+            # Quality preference (descending): no-suffix > 1080p > 720p > 480p > 360p > 240p
+            def _quality_score(u: str) -> int:
+                ul = u.lower()
+                # Look for explicit quality markers in either /1080.mp4 or _1080p.mp4 forms
+                for marker, score in (
+                    ("2160", 6), ("1440", 5), ("1080", 4), ("720", 3),
+                    ("480", 2), ("360", 1), ("240", 0),
+                ):
+                    if marker in ul:
+                        return score
+                return 100  # canonical (no quality suffix) — usually highest
+            all_streams.sort(key=_quality_score, reverse=True)
+            for stream_url in all_streams:
+                headers = {"Referer": iframe_url, "User-Agent": USER_AGENT}
+                if self._validate_or_pass(stream_url, headers):
+                    video.stream_url = stream_url
+                    video.stream_kind = "hls" if ".m3u8" in stream_url else "mp4"
+                    video.stream_headers = headers
+                    self._set_title(video, r.text)
+                    return True
+
+        # Tier 3: parent-page leak (rare)
+        for pat in (
+            r'(?:data-(?:src|video|file))\s*=\s*["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
+            r'(https?://[^\s"\'<>]+\.m3u8)',
+        ):
+            m = re.search(pat, r.text, re.IGNORECASE)
+            if m:
+                stream_url = _html.unescape(m.group(1))
+                headers = {"Referer": video.video_url, "User-Agent": USER_AGENT}
+                if self._validate_or_pass(stream_url, headers):
+                    video.stream_url = stream_url
+                    video.stream_kind = "hls" if ".m3u8" in stream_url else "mp4"
+                    video.stream_headers = headers
+                    self._set_title(video, r.text)
+                    return True
+
+        return False
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 ALL_SCRAPER_CLASSES = [
@@ -3653,6 +4266,8 @@ ALL_SCRAPER_CLASSES = [
     RedGifs, RedditUser,
     # Album-based (mp4 in <source> tag — easy direct downloads)
     Erome,
+    # Mainstream tube + cam-archive aggregators (May 2026 expansion)
+    PornHat, OkXxx, PornDoe, HQPorner,
     # Auth-required (only activates if cookies_file is set with valid cookies)
     XCom, Recume,
     # Login-required (username/password — auto-login on first probe)
