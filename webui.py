@@ -319,6 +319,21 @@ AUTH_SITES: dict[str, dict] = {
         "signup_url": "https://camsmut.com/register",
         "uses_credentials": True,
     },
+    "Tango": {
+        "label": "Tango Live (manual URL)",
+        "why": (
+            "Tango.me streams require a master.m3u8?token=... URL extracted "
+            "manually from the browser's Network tab. The bot expects this "
+            "URL in the room_id field (NOT the username). Use streams from "
+            "the 'Following' tab — those have static tokens that stay valid "
+            "for the duration of the live show. Streams from 'For You' or "
+            "'Explore' have token-refresh and won't keep recording. "
+            "See yt-dlp/yt-dlp#11433 for context."
+        ),
+        "cookies": [],
+        "signup_url": "https://www.tango.me/",
+        "uses_credentials": False,
+    },
 }
 
 

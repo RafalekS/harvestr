@@ -15,4 +15,5 @@ from .sexchathu import SexChatHU
 from .streamate import StreaMate
 from .stripchat import StripChat
 from .stripchat_vr import StripChatVR
+from .tango import Tango
 from .xlovecam import XLoveCam
