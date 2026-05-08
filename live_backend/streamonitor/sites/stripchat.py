@@ -616,60 +616,83 @@ class StripChat(RoomIdBot):
 
     @classmethod
     def getStatusBulk(cls, streamers):
-        """Bulk status check for all StripChat streamers at once."""
-        s = cls._get_session()
-        try:
-            r = s.get(
-                'https://stripchat.com/api/front/v2/models?limit=500&parentCategories=girls,guys,couples,trans&sortBy=viewers',
-                headers=cls.headers, timeout=10
-            )
-            if r.status_code != 200:
-                return
-            data = r.json()
-            models = data.get('models', data.get('items', []))
-            if not models:
-                return
+        """Bulk status check for all StripChat streamers.
 
-            # Build lookup by username (lowercase)
-            model_map = {}
-            for model in models:
-                info = cls.normalizeInfo(model) if isinstance(model, dict) else {}
-                uname = (info.get('username') or '').lower()
-                if uname:
-                    model_map[uname] = info
+        StripChat's old bulk endpoint
+        (`/api/front/v2/models?limit=500&parentCategories=...`) was
+        retired in early 2026 — it now returns HTTP 400 with
+        `{"error":"invalid 'primaryTag' value"}`. The new
+        `?primaryTag=girls&limit=10` returns a "blocks" homepage layout
+        rather than a flat model list, with no per-username status
+        info.
 
-            for streamer in streamers:
-                model_data = model_map.get(streamer.username.lower())
-                if not model_data:
-                    # Not in the top list — could be offline or private
-                    if streamer.sc not in (Status.PUBLIC, Status.PRIVATE, Status.RESTRICTED):
-                        streamer.setStatus(Status.OFFLINE)
-                    continue
+        Verified working endpoints (May 2026):
+          - `/api/front/v2/models/username/{u}/cam?uniq=...` — returns
+            the cam state for one model. THE ONLY working per-bot
+            status endpoint.
 
-                # Update gender
-                gender_str = model_data.get('gender', model_data.get('genderCategory', ''))
-                if gender_str:
-                    streamer.gender = cls._GENDER_MAP.get(gender_str.lower(), Gender.UNKNOWN)
+        So we fall back to PARALLEL per-username polling for the
+        bulk method. Concurrency is bounded by the shared HTTP semaphore
+        in `streamonitor/utils/cf_session.py` (default 32) so we don't
+        socket-exhaust the host even with 700+ models.
 
-                # Update country
-                country = model_data.get('country', '')
-                if country:
-                    streamer.country = country.upper()
+        Symptom this fixes: prior to this change, bulk silently
+        returned without setting any status (line `if r.status_code
+        != 200: return`). The bot's main loop then SKIPPED individual
+        `getStatus()` calls because `bulk_update=True` and
+        `sc != NOTRUNNING`. Effect: SC bots got their initial status
+        on first poll, then NEVER updated again — meaning we missed
+        every public-window opening after startup. In a 3-day log
+        window, this resulted in only 27 download attempts across
+        700+ models (vs. 15689 for Streamate where bulk works).
+        """
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        # Per-streamer status check, parallelized. Max 8 concurrent —
+        # the global semaphore at 32 covers ALL sites so we leave
+        # headroom for CB/CamSoda/etc. running concurrently.
+        active: list = []
+        for streamer in streamers:
+            # Quick optimization: if a streamer is already PUBLIC or
+            # RESTRICTED (already recording / about to record), skip
+            # the status probe — the running recording loop handles
+            # transitions on its own.
+            if streamer.sc in (Status.PUBLIC, Status.RESTRICTED):
+                continue
+            active.append(streamer)
+        if not active:
+            return
 
-                # Determine status
-                status_val = model_data.get('status', model_data.get('broadcastStatus', ''))
-                is_live = model_data.get('isLive', model_data.get('isCamActive', False))
-                if status_val == 'public' and is_live:
-                    if streamer.sc in (Status.PUBLIC, Status.RESTRICTED):
-                        continue
-                    status = streamer.getStatus()
-                elif status_val in cls._PRIVATE_STATUSES:
-                    status = Status.PRIVATE
-                else:
-                    status = Status.OFFLINE
-                streamer.setStatus(status)
-        except Exception:
-            pass
+        def _check_one(streamer):
+            try:
+                new_status = streamer.getStatus()
+                streamer.setStatus(new_status)
+                return None
+            except Exception as e:
+                # Don't crash the whole bulk pass if one streamer's
+                # check raises — just leave that bot at its previous
+                # status and move on.
+                return f"{streamer.username}: {type(e).__name__}: {e}"
+
+        # 8 workers × ~200ms each = ~25 seconds for 1000 bots.
+        # Matches the 30s default poll interval — plenty of headroom.
+        with ThreadPoolExecutor(max_workers=8, thread_name_prefix='sc-bulk') as pool:
+            errors = []
+            for fut in as_completed(pool.submit(_check_one, s) for s in active):
+                err = fut.result()
+                if err:
+                    errors.append(err)
+            if errors and len(errors) > len(active) // 2:
+                # More than half failed — likely a network issue, log so
+                # the user can investigate (StripChat down? CF block?).
+                # No log spam: only fires when something is genuinely
+                # broken.
+                # Use the first streamer's logger (they all share the
+                # same handler chain).
+                if streamers:
+                    streamers[0].logger.warning(
+                        f"StripChat bulk: {len(errors)}/{len(active)} "
+                        f"per-username probes failed — first error: {errors[0]}"
+                    )
 
     @classmethod
     def m3u_decoder(cls, content: str) -> str:

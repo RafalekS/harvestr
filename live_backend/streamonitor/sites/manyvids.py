@@ -141,6 +141,15 @@ class ManyVids(Bot):
         except requests.exceptions.RequestException as e:
             self.logger.error(f"Network error checking status: {e}")
             return Status.ERROR
+        except (TimeoutError, ConnectionError, OSError) as e:
+            # curl_cffi (CFSessionManager) raises a parallel exception
+            # tree from requests.exceptions — its TimeoutError /
+            # ConnectionError / DNSError all subclass OSError, NOT
+            # requests.exceptions.RequestException. Without this catch,
+            # transient socket failures fall through to the noisy
+            # catch-all and are logged as ERROR instead of RATELIMIT.
+            self.logger.debug(f"Network/timeout {type(e).__name__}: {e}")
+            return Status.RATELIMIT
         except (KeyError, ValueError) as e:
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR

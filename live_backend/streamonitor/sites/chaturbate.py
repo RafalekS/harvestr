@@ -102,6 +102,22 @@ class Chaturbate(Bot):
         except (KeyError, ValueError) as e:
             self.logger.error(f"Error parsing response: {e}")
             status = Status.ERROR
+        except (TimeoutError, ConnectionError, OSError) as e:
+            # curl_cffi (used by CFSessionManager) raises a parallel
+            # exception tree that does NOT inherit from
+            # requests.exceptions.RequestException — its TimeoutError /
+            # ConnectionError / DNSError all subclass OSError. Without
+            # this catch, every CB bot's status timeout fell through to
+            # the catch-all below and got logged as a noisy ERROR plus
+            # Status.ERROR (which doesn't trigger backoff).
+            #
+            # Treat as RATELIMIT so the bot's adaptive backoff increases
+            # the polling delay — same effect as a 429/5xx response.
+            # Demoted from ERROR to DEBUG since these are common
+            # transient failures under load (3000+/day at 700-bot scale,
+            # per the May 2026 streamonitor.log audit).
+            self.logger.debug(f"Network/timeout {type(e).__name__}: {e}")
+            status = Status.RATELIMIT
         except Exception as e:
             self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             status = Status.ERROR
