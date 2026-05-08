@@ -521,24 +521,64 @@ def _click_turnstile_real_mouse(page, log: Optional[logging.Logger] = None) -> b
     and are rejected. Playwright's page.mouse.click() generates a trusted
     event via CDP that Turnstile accepts.
 
-    Returns True if a click was issued. False if no Turnstile iframe was
-    visible — caller should retry on a later poll."""
+    Tries multiple selectors because Turnstile renders differently
+    depending on the challenge mode and lazy-loading state:
+      - iframe[src*=challenges.cloudflare.com]: classic interactive
+      - iframe[data-src*=...]: pre-bootstrap (src not set yet)
+      - div.cf-turnstile: outer container (always present once the
+        Turnstile script has initialized)
+      - div[id^=cf-chl-widget]: managed challenge container
+      - sole iframe on page: most embed pages have only the CF iframe
+        before the player loads.
+    Returns True if a click was issued. False if no widget was visible
+    — caller should retry on a later poll."""
     import random
     try:
-        cf_iframe = page.locator('iframe[src*="challenges.cloudflare.com"]').first
-        if cf_iframe.count() == 0:
+        selectors = (
+            'iframe[src*="challenges.cloudflare.com"]',
+            'iframe[data-src*="challenges.cloudflare.com"]',
+            'iframe[src*="turnstile"]',
+            'iframe[title*="Cloudflare"]',
+            'iframe[title*="security challenge"]',
+            'div.cf-turnstile',
+            'div[id^="cf-chl-widget"]',
+        )
+        target_loc = None
+        chosen_sel = ""
+        for sel in selectors:
+            try:
+                loc = page.locator(sel).first
+                if loc.count() == 0:
+                    continue
+                try:
+                    loc.wait_for(state="visible", timeout=2000)
+                except Exception:
+                    pass
+                bb = loc.bounding_box()
+                if bb and bb.get("width", 0) >= 50 and bb.get("height", 0) >= 30:
+                    target_loc = loc
+                    chosen_sel = sel
+                    break
+            except Exception:
+                continue
+        if target_loc is None:
+            try:
+                all_iframes = page.locator('iframe')
+                if all_iframes.count() == 1:
+                    only = all_iframes.first
+                    bb = only.bounding_box()
+                    if bb and bb.get("width", 0) >= 50:
+                        target_loc = only
+                        chosen_sel = 'iframe (sole on page)'
+            except Exception:
+                pass
+            if target_loc is None:
+                if log:
+                    log.debug("  Turnstile: no iframe match (lazy-loaded?)")
+                return False
+        box = target_loc.bounding_box()
+        if not box:
             return False
-        try:
-            cf_iframe.wait_for(state="visible", timeout=3000)
-        except Exception:
-            pass
-        box = cf_iframe.bounding_box()
-        if not box or box.get("width", 0) < 50:
-            return False
-        # Checkbox is at the LEFT side of the Turnstile widget (~30px in,
-        # vertical center). Approach with intermediate mouse moves to
-        # mimic human cursor movement (instant teleport-to-target is a
-        # bot tell that Cloudflare's score model penalizes).
         target_x = box["x"] + 30
         target_y = box["y"] + box["height"] / 2
         page.mouse.move(target_x - 200, target_y - 80, steps=8)
@@ -547,7 +587,9 @@ def _click_turnstile_real_mouse(page, log: Optional[logging.Logger] = None) -> b
         page.wait_for_timeout(300 + random.randint(120, 400))
         page.mouse.click(target_x, target_y, delay=random.randint(40, 110))
         if log:
-            log.debug(f"  Turnstile: clicked iframe at ({target_x:.0f},{target_y:.0f})")
+            log.info(f"  Turnstile: clicked {chosen_sel} at "
+                       f"({target_x:.0f},{target_y:.0f}) "
+                       f"box={box['width']:.0f}x{box['height']:.0f}")
         return True
     except Exception as e:
         if log:
