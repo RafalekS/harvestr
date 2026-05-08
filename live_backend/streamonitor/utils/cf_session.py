@@ -251,6 +251,27 @@ class _HostState:
             self.next_ok_time = 0.0
 
 
+# Process-wide semaphore: cap simultaneous HTTP calls across ALL bots.
+# Without this, 745 bots with their own per-bot session pools open 1000s
+# of sockets at once and Windows returns WinError 1450 ("insufficient
+# system resources"). 32 in-flight requests is a safe upper bound for a
+# Windows host with default handle limits — most calls take <1s so this
+# rate-limits to ~30 req/sec aggregate, which the OS can sustain.
+import asyncio as _asyncio
+_GLOBAL_HTTP_SEM: Optional[_asyncio.Semaphore] = None
+
+
+def _get_global_http_sem() -> _asyncio.Semaphore:
+    """Lazy-init the shared semaphore on first use. Each event loop owns
+    its own Semaphore (asyncio Semaphore is loop-bound), but in the
+    StreaMonitor design every bot shares ONE event loop via the cf_session
+    `_run()` helper, so this resolves to a single shared instance."""
+    global _GLOBAL_HTTP_SEM
+    if _GLOBAL_HTTP_SEM is None:
+        _GLOBAL_HTTP_SEM = _asyncio.Semaphore(32)
+    return _GLOBAL_HTTP_SEM
+
+
 # ---------- Robust request with retries ----------
 async def _perform_with_retries(hs: _HostState, method: str, url: str, **kwargs):
     """
@@ -264,15 +285,12 @@ async def _perform_with_retries(hs: _HostState, method: str, url: str, **kwargs)
     last_exc = None
     for attempt in range(5):  # 1 initial + 4 retries for extra resilience on HTTP/2
         try:
-            # Always reset session on HTTP/2 errors (not just on retry)
-            # This is more aggressive but necessary for HTTP/2 stability
             if attempt > 0:
-                # Force session renewal on retry to avoid stale HTTP/2 connections
                 await hs._reset_session()
-                # Extra delay for HTTP/2 errors to ensure connection is fully closed
                 await asyncio.sleep(0.1)
-            
-            return await hs.sess.request(method, url, **kwargs)
+            # Process-wide concurrency cap (see _get_global_http_sem above)
+            async with _get_global_http_sem():
+                return await hs.sess.request(method, url, **kwargs)
         except (CurlSSLError, CurlConnectionError, CurlTimeout, CurlRequestError, CurlHTTPError) as e:
             last_exc = e
             error_str = str(e).lower()

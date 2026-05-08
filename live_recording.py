@@ -84,7 +84,9 @@ if _STREAMONITOR_PATH:
         # live_output_dir = <output_dir>/_live, but the user can override
         # it in the Live settings modal to put recordings on a different
         # drive (e.g. a secondary disk with more space for long streams).
-        _LIVE_DIR = Path(__file__).resolve().parent / "downloads" / "_live"
+        _LIVE_DEFAULT = Path(__file__).resolve().parent / "downloads" / "_live"
+        _LIVE_DIR = _LIVE_DEFAULT
+        _user_live: str = ""
         try:
             _cfg_path_early = Path(__file__).resolve().parent / "config.json"
             if _cfg_path_early.exists():
@@ -94,7 +96,25 @@ if _STREAMONITOR_PATH:
                     _LIVE_DIR = Path(_user_live).expanduser()
         except Exception:
             pass
-        _LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        # Try the configured live dir, but fall back to the default if it's
+        # unreachable (e.g. D:\ no longer mounted). Otherwise StreaMonitor's
+        # bots loop forever on FileNotFoundError when they try to record.
+        try:
+            _LIVE_DIR.mkdir(parents=True, exist_ok=True)
+        except (OSError, FileNotFoundError) as _mk_err:
+            log.warning(
+                f"  [live] configured live_output_dir is unreachable "
+                f"({_user_live!r}: {_mk_err}); falling back to {_LIVE_DEFAULT}"
+            )
+            _LIVE_DIR = _LIVE_DEFAULT
+            try:
+                _LIVE_DIR.mkdir(parents=True, exist_ok=True)
+            except Exception as _e2:
+                # If even the default can't be created (extremely unusual),
+                # we still want StreaMonitor to import — it'll just error
+                # at recording-time per-bot rather than tearing the whole
+                # Live subsystem down.
+                log.warning(f"  [live] default live dir also failed: {_e2}")
         os.environ["STRMNTR_DOWNLOAD_DIR"] = str(_LIVE_DIR)
         # Apply Live settings from config.json (read BEFORE import so
         # parameters.py sees them). These map to StreaMonitor's env hooks.
@@ -184,6 +204,101 @@ def status_ui(status_name: str) -> Tuple[str, str]:
     return STATUS_UI.get(status_name, (status_name.lower(), "text-3"))
 
 
+# ── Camsmut downloader sync ──────────────────────────────────────────────────
+# When a user is added to live recording, also push them to the front of the
+# sibling camsmut downloader's performers list (so they get downloaded first
+# next time the camsmut batch runs). Best-effort: silently skipped if the
+# camsmut config can't be located, and never propagates exceptions.
+
+_CAMSMUT_CONFIG_DEFAULT = _HERE.parent / "camsmut" / "camsmut_config.json"
+
+
+def _camsmut_config_path() -> Optional[Path]:
+    """Locate the camsmut downloader's config file. Env var wins."""
+    override = os.environ.get("HARVESTR_CAMSMUT_CONFIG", "").strip()
+    if override:
+        p = Path(override)
+        return p if p.exists() else None
+    return _CAMSMUT_CONFIG_DEFAULT if _CAMSMUT_CONFIG_DEFAULT.exists() else None
+
+
+def _sync_to_camsmut(usernames) -> None:
+    """Push usernames to the front of camsmut's `performers` list.
+
+    Semantics:
+      - Case-insensitive dedupe — if a username already exists, it is moved
+        to the front (promoted) using its first-seen casing.
+      - Atomic write via .json.tmp + os.replace.
+      - Multiple usernames preserve their input order: input [A, B, C]
+        ends up as [A, B, C, ...rest] at the front of the list.
+      - Best-effort: any failure is logged at debug level, never raised.
+
+    Accepts a single string or an iterable of strings.
+    """
+    if isinstance(usernames, str):
+        usernames = [usernames]
+    usernames = [u.strip() for u in (usernames or []) if u and u.strip()]
+    if not usernames:
+        return
+
+    cfg_path = _camsmut_config_path()
+    if cfg_path is None:
+        log.debug("[live] camsmut sync: config not found (skipping)")
+        return
+
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as e:
+        log.debug(f"[live] camsmut sync: load failed: {e}")
+        return
+
+    performers = data.get("performers")
+    if not isinstance(performers, list):
+        performers = []
+    # Coerce any stray non-strings out — defensive, the file is hand-edited
+    performers = [p for p in performers if isinstance(p, str)]
+
+    added: List[str] = []
+    promoted: List[str] = []
+    # Iterate in reverse so each insert-at-0 lands the FIRST input at index 0:
+    # input [A,B,C] → reverse to C,B,A → insert each at 0 → list ends [A,B,C,...]
+    for u in reversed(usernames):
+        ul = u.lower()
+        old_idx = next((i for i, p in enumerate(performers) if p.lower() == ul), None)
+        if old_idx is None:
+            performers.insert(0, u)
+            added.append(u)
+        else:
+            if old_idx == 0:
+                continue  # already at front — nothing to do
+            existing = performers.pop(old_idx)
+            performers.insert(0, existing)   # preserve original casing
+            promoted.append(existing)
+
+    if not added and not promoted:
+        return
+
+    data["performers"] = performers
+    tmp = cfg_path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, cfg_path)
+    except Exception as e:
+        log.debug(f"[live] camsmut sync: write failed: {e}")
+        try:
+            tmp.unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+
+    if added:
+        log.info(f"  [live] camsmut sync: queued {added} at front")
+    if promoted:
+        log.info(f"  [live] camsmut sync: promoted {promoted} to front")
+
+
 # ── LiveManager — glue layer for the UI ──────────────────────────────────────
 
 @dataclass
@@ -219,7 +334,13 @@ class LiveManager:
     def _resolve_live_dir(self) -> Path:
         """Live recordings go to config.live.live_output_dir (if set) or
         downloads/_live/. Called at init time — same time the env var for
-        StreaMonitor is set, so it's consistent with where recordings land."""
+        StreaMonitor is set, so it's consistent with where recordings land.
+
+        If the user-configured dir is unreachable (e.g. an external drive
+        that isn't mounted), fall back to the default. This must match the
+        fallback logic in the module-level STRMNTR_DOWNLOAD_DIR setup so
+        the Bot threads write somewhere they can actually create folders."""
+        default = self.downloads_dir / "_live"
         try:
             cfg_path = Path(__file__).resolve().parent / "config.json"
             if cfg_path.exists():
@@ -227,13 +348,18 @@ class LiveManager:
                 live_dir = (cfg.get("live") or {}).get("live_output_dir") or ""
                 if live_dir:
                     p = Path(live_dir).expanduser()
-                    p.mkdir(parents=True, exist_ok=True)
-                    return p
+                    try:
+                        p.mkdir(parents=True, exist_ok=True)
+                        return p
+                    except (OSError, FileNotFoundError) as e:
+                        log.warning(
+                            f"[live] live_output_dir {p} is unreachable "
+                            f"({e}); falling back to {default}"
+                        )
         except Exception as e:
             log.debug(f"[live] resolve live_dir: {e}")
-        p = self.downloads_dir / "_live"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+        default.mkdir(parents=True, exist_ok=True)
+        return default
 
     def model_folder(self, username: str, site: str) -> Path:
         """Where this model's recordings live on disk."""
@@ -492,6 +618,7 @@ class LiveManager:
         Duplicates are silently skipped. Returns counts."""
         added = 0
         errors: List[str] = []
+        synced_users: List[str] = []
         for entry in entries:
             if not isinstance(entry, dict):
                 continue
@@ -501,20 +628,30 @@ class LiveManager:
             if not u or not s:
                 continue
             try:
-                self.add_model(u, s, room_id=rid)
+                # Suppress per-call camsmut sync; we batch-sync at the end
+                # to do a single atomic write and preserve input order.
+                self.add_model(u, s, room_id=rid, _sync_camsmut=False)
                 added += 1
+                synced_users.append(u)
             except Exception as e:
                 errors.append(f"{u}|{s}: {e}")
+        if synced_users:
+            _sync_to_camsmut(synced_users)
         return {"ok": True, "added": added, "errors": errors,
                 "total": len(self._models)}
 
     def add_model(self, username: str, site: str,
-                  room_id: Optional[str] = None) -> Dict[str, Any]:
+                  room_id: Optional[str] = None,
+                  _sync_camsmut: bool = True) -> Dict[str, Any]:
         username = (username or "").strip()
         site = (site or "").strip()
         if not username:
             raise ValueError("username required")
         self._create_bot(username, site, room_id=room_id, autostart=False)
+        # Mirror this user into the camsmut downloader's performers list
+        # (front of queue). Suppressed by bulk_add for batched syncing.
+        if _sync_camsmut:
+            _sync_to_camsmut(username)
         return {"ok": True, "key": self.key_of(username, site)}
 
     def remove_model(self, username: str, site: str) -> Dict[str, Any]:

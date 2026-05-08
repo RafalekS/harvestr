@@ -55,7 +55,7 @@ class XLoveCam(Bot):
             
             for performer in performer_list:
                 if isinstance(performer, dict):
-                    nickname = performer.get('nickname', '').lower()
+                    nickname = (performer.get('nickname') or '').lower()
                     if nickname == self.username.lower():
                         return performer.get('id')
             return None
@@ -130,7 +130,7 @@ class XLoveCam(Bot):
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
     
     def isMobile(self) -> bool:

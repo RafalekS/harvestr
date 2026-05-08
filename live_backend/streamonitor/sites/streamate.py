@@ -87,7 +87,7 @@ class StreaMate(Bot):
             self.logger.error(f"Network error checking status: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
     
     def isMobile(self) -> bool:

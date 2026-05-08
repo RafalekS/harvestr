@@ -130,7 +130,7 @@ class SexChatHU(RoomIdBot):
             if not self.lastInfo.get("active"):
                 return Status.NOTEXIST
                 
-            online_status = self.lastInfo.get("onlineStatus", "").lower()
+            online_status = (self.lastInfo.get("onlineStatus") or '').lower()
             
             if online_status == "free":
                 # Check if HLS stream is available
@@ -156,7 +156,7 @@ class SexChatHU(RoomIdBot):
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
 
     def isMobile(self) -> bool:
@@ -204,7 +204,7 @@ class SexChatHU(RoomIdBot):
         babe_map = {}
         for babe in babes:
             if isinstance(babe, dict):
-                sn = babe.get('screenname', '').lower()
+                sn = (babe.get('screenname') or '').lower()
                 if sn:
                     babe_map[sn] = babe
 
@@ -214,7 +214,7 @@ class SexChatHU(RoomIdBot):
                 if streamer.sc not in (Status.PUBLIC, Status.PRIVATE, Status.RESTRICTED):
                     streamer.setStatus(Status.OFFLINE)
                 continue
-            online_status = babe.get('onlineStatus', '').lower()
+            online_status = (babe.get('onlineStatus') or '').lower()
             if online_status == 'free':
                 if streamer.sc in (Status.PUBLIC, Status.RESTRICTED):
                     continue

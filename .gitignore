@@ -57,6 +57,17 @@ Thumbs.db
 # Embedded Tor runtime cache (tor_helper.py writes consensus/microdesc here)
 _tor_data/
 
+# Live recording rolling-playlist scratch files (StreaMonitor M3U8 buffer)
+live_backend/M3U8_TMP/
+M3U8_TMP/
+
+# Per-site cookie jars (sensitive — exported from browser per user)
+cookies/
+
+# Live recording manager state (regenerated at runtime; site-specific)
+live_models.json
+_progress.json
+
 # Local research / notes / assistant scratch — not shipped with the project
 research/
 **/.claude/

@@ -805,6 +805,13 @@ class UniversalDownloader:
         self.engine = YtdlpEngine(config, log)
         # Live progress tracker — the web UI tails downloads/_progress.json
         self.progress = ProgressTracker(self.output_dir)
+        # Expose the progress path to the SIGTERM/SIGBREAK handler so a
+        # clean kill from the webui flips running:false on disk before
+        # the daemon threads get torn down.
+        try:
+            _progress_path_holder["path"] = str(self.progress.path)
+        except Exception:
+            pass
         # Site-drift tracker — persistent per-site success/fail ledger
         # so the UI can surface sites that used to work but now fail.
         self.health = SiteHealth(self.output_dir)
@@ -2004,7 +2011,58 @@ def main() -> int:
     return 0
 
 
+def _install_clean_shutdown() -> None:
+    """Wire signal handlers so a SIGTERM/SIGBREAK from the webui's
+    `taskkill /T` (or Ctrl-Break in console) clears _progress.json's
+    running flag before exit. Without this, the downloader's daemon
+    threads die mid-probe with `running: true` still set on disk, and
+    the UI shows 'archive stuck at probing' until the next session_end."""
+    import signal
+
+    def _flag_done(*_a):
+        try:
+            pp = Path(_progress_path_holder["path"]) if _progress_path_holder.get("path") else None
+            if pp and pp.exists():
+                with open(pp, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                sess = data.get("session") or {}
+                sess["running"] = False
+                sess["phase"] = "idle"
+                sess["phase_label"] = "idle"
+                data["session"] = sess
+                data["active"] = []
+                tmp = pp.with_suffix(".json.tmp")
+                tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                               encoding="utf-8")
+                os.replace(tmp, pp)
+        except Exception:
+            pass
+        # SIGTERM (15) or SIGBREAK on Windows → exit non-zero so the parent
+        # webui's proc.wait() sees a non-zero return and re-enables Start.
+        os._exit(143)
+
+    # SIGTERM is the standard "please exit" signal. On Windows, a CTRL_BREAK
+    # event (sent by the parent or by Ctrl-Break in console) fires SIGBREAK.
+    try:
+        signal.signal(signal.SIGTERM, _flag_done)
+    except Exception:
+        pass
+    if hasattr(signal, "SIGBREAK"):   # Windows-only
+        try:
+            signal.signal(signal.SIGBREAK, _flag_done)
+        except Exception:
+            pass
+
+
+# Module-level holder so the signal handler can find the progress file path
+# without needing access to the UniversalDownloader instance (which is a
+# local in main()). UniversalDownloader.__init__ writes its tracker path
+# into this dict so the handler can reach it.
+_progress_path_holder: Dict[str, str] = {}
+
+
 if __name__ == "__main__":
+    _install_clean_shutdown()
     rc = 0
     try:
         rc = main()

@@ -25,7 +25,7 @@ class FanslyLive(RoomIdBot):
         r = self.session.get(f'https://apiv3.fansly.com/api/v1/account?usernames={username}&ngsw-bypass=true')
         data = r.json()
         for streamer in data.get('response', []):
-            if streamer.get('username').lower() == username.lower():
+            if (streamer.get('username') or '').lower() == username.lower():
                 self.username = streamer['username']
                 return streamer.get('id')
         return None

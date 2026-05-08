@@ -69,7 +69,7 @@ class CamsCom(Bot):
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
 
     def isMobile(self) -> bool:

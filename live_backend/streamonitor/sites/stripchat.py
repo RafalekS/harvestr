@@ -156,13 +156,40 @@ class StripChat(RoomIdBot):
             else:
                 raise Exception(f"'featureSettings' not found. Available keys: {list(static_data.keys())}")
 
-            if "featuresV2" not in static_data:
-                raise Exception(f"'featuresV2' not found. Available keys: {list(static_data.keys())}")
-
-            if "playerModuleExternalLoading" not in static_data["featuresV2"]:
-                raise Exception("'playerModuleExternalLoading' not found in featuresV2")
-
-            mmp_version = static_data["featuresV2"]["playerModuleExternalLoading"]["mmpVersion"]
+            # New StripChat config schema (May 2026) removed `featuresV2`
+            # entirely. The MMP version is no longer in the API config; it's
+            # now embedded in the homepage HTML as part of the player URL.
+            # Adopting the upstream fix from lossless1024/StreaMonitor#268:
+            #
+            #   1. Scrape the homepage HTML for the regex
+            #        mmp\.doppiocdn\.com/player/mmp/(v[\d.]+)/
+            #   2. Fall back to a known-good hardcoded version if scrape fails
+            #
+            # If both fail (no network, blocked, etc.) we soft-fail — populate
+            # static_data with cached keys so add_model() succeeds and status
+            # polling continues. Only the on-the-fly mouflon key refresh is
+            # then disabled, but cached keys carry recording.
+            _MMP_FALLBACK_VERSION = "v2.6.0"
+            mmp_version = _MMP_FALLBACK_VERSION
+            if "featuresV2" in static_data and \
+                    "playerModuleExternalLoading" in static_data["featuresV2"]:
+                # Old schema still around (rare) — use it
+                mmp_version = static_data["featuresV2"]["playerModuleExternalLoading"]["mmpVersion"]
+            else:
+                # Scrape the version from the homepage
+                try:
+                    r_home = s.get("https://stripchat.com", headers=cls.headers,
+                                    timeout=5)
+                    r_home.raise_for_status()
+                    version_match = re.search(
+                        r'mmp\.doppiocdn\.com/player/mmp/(v[\d.]+)/',
+                        r_home.text
+                    )
+                    if version_match:
+                        mmp_version = version_match.group(1)
+                except Exception:
+                    # Couldn't reach homepage — fall back to hardcoded version
+                    pass
 
             mmp_base = f"{mmp_origin}/{mmp_version}"
 
@@ -607,7 +634,7 @@ class StripChat(RoomIdBot):
             model_map = {}
             for model in models:
                 info = cls.normalizeInfo(model) if isinstance(model, dict) else {}
-                uname = info.get('username', '').lower()
+                uname = (info.get('username') or '').lower()
                 if uname:
                     model_map[uname] = info
 

@@ -63,11 +63,19 @@ class Bot(Thread):
     url: str = "javascript:void(0)"
     recording: bool = False
     sleep_on_private: int = 5
-    sleep_on_offline: int = 5
-    sleep_on_long_offline: int = 15  # Further reduced from 30 to 15 seconds
-    sleep_on_error: int = 20
+    sleep_on_offline: int = 8
+    sleep_on_long_offline: int = 60   # Was 15s — at 200+ LONG_OFFLINE bots
+                                       # × 1/15s, that's 13 req/sec just for
+                                       # offline polling, which contributed
+                                       # to WinError 1450 socket-exhaustion.
+                                       # 60s = 3 req/sec instead.
+    sleep_on_error: int = 60          # Was 20s — back off harder so 500
+                                       # erroring bots aren't pinging the
+                                       # net every 20s.
     sleep_on_ratelimit: int = 180
-    long_offline_timeout: int = 180  # Reduced from 300 to 180 seconds (3min instead of 5min)
+    long_offline_timeout: int = 300   # Back to 5 min so bots take longer
+                                       # to enter long-offline mode (gives
+                                       # them more chances to recover)
     previous_status: Optional[Status] = None
     _GENDER_MAP: Dict[str, Gender] = {}  # Override in site subclasses to map API gender strings to Gender enum
 
@@ -542,7 +550,25 @@ class Bot(Thread):
                 self.logger.verbose("Bot quit before starting")
                 return
 
-            self.logger.verbose("Bot main loop starting")
+            # Startup jitter: with hundreds of bots restarting at once
+            # (webui boot), all firing their first status check
+            # simultaneously exhausts the Windows socket pool
+            # (WinError 1450 "insufficient system resources" was the
+            # actual error that was silent because str(WindowsError)=='').
+            # Spread first-polls across 5 minutes so the load comes in at
+            # ~2-3/sec instead of a thunderstorm. Bots that were already
+            # PUBLIC last save get a SHORT stagger (so live recordings
+            # resume quickly); bots that were ERROR/OFFLINE get the FULL
+            # stagger (they're not urgent — they were already stuck).
+            import random as _r
+            from streamonitor.enums import Status as _S
+            _was_active = self.previous_status in (_S.PUBLIC, _S.RECORDING) \
+                          if hasattr(self, "previous_status") and self.previous_status else False
+            _stagger = _r.uniform(0, 30) if _was_active else _r.uniform(0, 300)
+            self.logger.verbose(f"Bot main loop starting (stagger {_stagger:.1f}s, "
+                                  f"was_active={_was_active})")
+            self._sleep(_stagger)
+
             offline_time = 0
             
             while self.running and not self.quitting:
@@ -633,6 +659,18 @@ class Bot(Thread):
                     self._sleep(self.sleep_on_private)
                 else:
                     self._sleep(self.sleep_on_offline)
+
+                # Adaptive backoff: when a bot has many consecutive errors
+                # (Status.ERROR streak), exponentially extend its polling
+                # interval. Without this, ~500 chronically-erroring bots
+                # poll every 20s and exhaust Windows socket handles
+                # (WinError 1450 — silent in old logs because
+                # str(WindowsError) was empty). Cap at 5 minutes so a
+                # recovering bot doesn't take an hour to come back.
+                if self.sc == Status.ERROR and self._consecutive_errors > 0:
+                    extra = min(300, int(2 ** min(self._consecutive_errors, 6)) * 5)
+                    if extra > 0:
+                        self._sleep(extra)
 
             self.sc = Status.NOTRUNNING
             self.log("Stopped")

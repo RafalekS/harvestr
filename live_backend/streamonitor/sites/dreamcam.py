@@ -55,7 +55,7 @@ class DreamCam(Bot):
 
             self.lastInfo = response.json()
             
-            broadcast_status = self.lastInfo.get("broadcastStatus", "").lower()
+            broadcast_status = (self.lastInfo.get("broadcastStatus") or '').lower()
 
             if broadcast_status == "public":
                 return Status.PUBLIC
@@ -74,7 +74,7 @@ class DreamCam(Bot):
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
 
     def isMobile(self) -> bool:

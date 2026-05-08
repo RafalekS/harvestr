@@ -287,7 +287,7 @@ class CamSoda(Bot):
             self.logger.error(f"Error parsing response: {e}")
             return {"__status__": Status.ERROR}
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return {"__status__": Status.ERROR}
 
     # ──────────────── Convenience methods ────────────────

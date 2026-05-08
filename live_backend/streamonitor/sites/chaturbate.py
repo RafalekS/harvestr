@@ -89,7 +89,9 @@ class Chaturbate(Bot):
                 
             self.lastInfo = response.json()
 
-            room_status = self.lastInfo.get("room_status", "").lower()
+            # Defensive: if the API returns room_status: null (edge case),
+            # .get('key','') returns None — not the default ''. Coerce via or ''.
+            room_status = (self.lastInfo.get("room_status") or "").lower()
             status = self._parseStatus(room_status)
             if status == Status.PUBLIC and not self.lastInfo.get('url'):
                 status = Status.RESTRICTED
@@ -101,7 +103,7 @@ class Chaturbate(Bot):
             self.logger.error(f"Error parsing response: {e}")
             status = Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             status = Status.ERROR
 
         self.ratelimit = status == Status.RATELIMIT

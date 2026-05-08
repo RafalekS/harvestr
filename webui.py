@@ -32,7 +32,7 @@ from datetime import datetime
 from pathlib import Path
 
 try:
-    from flask import Flask, jsonify, render_template_string, request, send_file
+    from flask import Flask, jsonify, make_response, render_template_string, request, send_file
 except ImportError:
     print("ERROR: Flask is required. Install with: pip install flask")
     sys.exit(1)
@@ -73,6 +73,163 @@ _state = {
 }
 _state_lock = threading.Lock()
 _runner_thread: subprocess.Popen | None = None
+
+# ── Mutual-exclusion helpers (Live ⇄ Archive) ────────────────────────────────
+# Only one mode can be active at a time. Starting Archive stops all Live bots
+# first; starting Live kills any tracked Archive subprocess first. _mode_lock
+# serializes these transitions so two clicks can't race into a half-state.
+_mode_lock = threading.Lock()
+
+
+def _pid_alive(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            PROCESS_QUERY_INFORMATION = 0x0400
+            kernel32 = ctypes.windll.kernel32
+            h = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, int(pid))
+            if h:
+                kernel32.CloseHandle(h)
+                return True
+            return False
+        else:
+            os.kill(int(pid), 0)
+            return True
+    except Exception:
+        return False
+
+
+def _clear_stale_progress() -> bool:
+    """Reset _progress.json's session.running flag. Called after killing an
+    archive subprocess (to update the UI immediately) and at webui startup
+    (to drop stale state from a prior crashed run). Returns True if it
+    actually cleared something."""
+    pp = DOWNLOADS_DIR / "_progress.json"
+    if not pp.exists():
+        return False
+    try:
+        with open(pp, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception:
+        return False
+    sess = data.get("session") or {}
+    if not sess.get("running"):
+        return False
+    sess["running"] = False
+    sess["phase"] = "idle"
+    sess["phase_label"] = "idle"
+    data["session"] = sess
+    data["active"] = []   # unstick the UI's active-rows list too
+    tmp = pp.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False),
+                       encoding="utf-8")
+        os.replace(tmp, pp)
+    except Exception:
+        try: tmp.unlink()
+        except Exception: pass
+        return False
+    return True
+
+
+def _archive_is_running() -> bool:
+    """True if a tracked archive subprocess is alive OR _progress.json says
+    running with a PID that's still alive. (External CLI runs would also
+    register here.)"""
+    with _state_lock:
+        proc = _runner_thread
+    if proc and proc.poll() is None:
+        return True
+    try:
+        pp = DOWNLOADS_DIR / "_progress.json"
+        if pp.exists():
+            data = json.loads(pp.read_text(encoding="utf-8"))
+            sess = data.get("session") or {}
+            if sess.get("running"):
+                pid = int(sess.get("pid", 0) or 0)
+                if pid and _pid_alive(pid):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def _kill_archive_subprocess(timeout: float = 10.0) -> bool:
+    """Kill the tracked archive subprocess and clear stale progress state.
+    Idempotent — safe to call when no archive is running. Returns True if
+    something was actually killed."""
+    global _runner_thread
+    killed = False
+    with _state_lock:
+        proc = _runner_thread
+    if proc and proc.poll() is None:
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                              capture_output=True, timeout=timeout)
+            else:
+                proc.terminate()
+            try:
+                proc.wait(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Subprocess didn't die — try kill() as last resort
+                try: proc.kill()
+                except Exception: pass
+            killed = True
+        except Exception:
+            pass
+    # Also kill any external runner whose PID is in _progress.json (CLI run)
+    try:
+        pp = DOWNLOADS_DIR / "_progress.json"
+        if pp.exists():
+            data = json.loads(pp.read_text(encoding="utf-8"))
+            sess = data.get("session") or {}
+            ext_pid = int(sess.get("pid", 0) or 0)
+            our_pid = int(proc.pid) if proc else -1
+            if (ext_pid and ext_pid != our_pid and ext_pid != os.getpid()
+                    and _pid_alive(ext_pid)):
+                if sys.platform == "win32":
+                    subprocess.run(["taskkill", "/F", "/T", "/PID", str(ext_pid)],
+                                  capture_output=True, timeout=timeout)
+                    killed = True
+                else:
+                    try:
+                        os.kill(ext_pid, 9)
+                        killed = True
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    with _state_lock:
+        _state["running"] = False
+        _state["pid"] = None
+        _runner_thread = None
+    _clear_stale_progress()
+    return killed
+
+
+def _stop_all_live_bots() -> int:
+    """Stop every running live bot. Returns count stopped. Safe if _live
+    is None or unavailable."""
+    if not _live:
+        return 0
+    try:
+        result = _live.toggle_all(False)
+        return int(result.get("count", 0)) if isinstance(result, dict) else 0
+    except Exception:
+        return 0
+
+
+# At startup: drop any stale archive-running flag from a previous crashed run.
+# We're the authority for archive subprocess lifecycle in this process; if the
+# webui just (re)started, no archive is running. The flag would otherwise stay
+# stuck-true and disable the Start button forever.
+try:
+    _clear_stale_progress()
+except Exception:
+    pass
 
 
 def load_config() -> dict:
@@ -183,6 +340,9 @@ def load_sites_detailed() -> list[dict]:
         "camcaps_tv": "cam", "camcaps_io": "cam", "camstreams_tv": "cam",
         "porntrex": "cam", "camsrip": "cam", "recordbate": "cam",
         "archivebate": "cam", "camvault": "cam", "recume": "cam",
+        # New (May 2026): cam-rip aggregators + erome album host
+        "showcamrips": "cam", "webcamsrips": "cam",
+        "erome": "adult",
     }
 
     out: list[dict] = []
@@ -2814,12 +2974,16 @@ let _liveSnapshot = {available: false, models: [], summary: {}};
 let _liveSites = [];
 
 async function liveLoadSites() {
+  console.debug('[live] liveLoadSites');
   if (_liveSites.length) return;
   try {
     const d = await api('/api/live/sites');
     _liveSites = d.sites || [];
+    console.debug('[live] sites loaded:', _liveSites.length);
     const sel = document.getElementById('live-new-site');
     const fsel = document.getElementById('live-site-filter');
+    if (!sel) { console.error('[live] live-new-site element missing'); return; }
+    if (!fsel) { console.error('[live] live-site-filter element missing'); return; }
     _liveSites.forEach(s => {
       const o1 = document.createElement('option');
       o1.value = s.name; o1.textContent = `${s.name} (${s.slug})`;
@@ -2845,9 +3009,12 @@ async function liveRefresh() {
   try {
     _liveSnapshot = await api('/api/live/status');
   } catch(e) {
-    console.error('liveRefresh', e);
+    console.error('liveRefresh failed', e);
     return;
   }
+  console.debug('[live] status: total=' + (_liveSnapshot.summary?.total ?? 0)
+                + ' running=' + (_liveSnapshot.summary?.running ?? 0)
+                + ' recording=' + (_liveSnapshot.summary?.recording ?? 0));
   const avail = !!_liveSnapshot.available;
   document.getElementById('live-available').style.display = avail ? '' : 'none';
   document.getElementById('live-unavailable').style.display = avail ? 'none' : '';
@@ -3837,7 +4004,16 @@ threading.Thread(target=_monitor_subprocess, daemon=True).start()
 # ── API routes ───────────────────────────────────────────────────────────────
 @app.route("/")
 def index():
-    return render_template_string(INDEX_HTML)
+    """Serve the SPA. Cache-Control headers force the browser to revalidate
+    on every load — the inline JS is large and changes frequently, and a
+    stale cache from an earlier session causes silent rendering failures
+    (UI loads but stays blank because the JS expects a different DOM
+    shape or API response than what's now served)."""
+    resp = make_response(render_template_string(INDEX_HTML))
+    resp.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
+    resp.headers["Pragma"] = "no-cache"
+    resp.headers["Expires"] = "0"
+    return resp
 
 
 @app.route("/api/status")
@@ -4242,64 +4418,67 @@ def api_site_health():
 
 @app.route("/api/run", methods=["POST"])
 def api_run():
+    """Start the archive download subprocess.
+
+    Mutual exclusion: stops every running Live bot before launching the
+    archive subprocess. The two modes can't be active at once — a running
+    archive saturates the same network/CPU/disk pipes Live needs to keep
+    its open RTMP/HLS streams from dropping segments."""
     global _runner_thread
-    with _state_lock:
-        if _state["running"]:
-            return jsonify({"error": "already running"}), 400
+    with _mode_lock:
+        with _state_lock:
+            if _state["running"]:
+                return jsonify({"error": "already running"}), 400
 
-    # Optional: specific performer
-    try:
-        body = request.get_json(silent=True) or {}
-    except Exception:
-        body = {}
-    performer = body.get("performer")
+        # Stop any active Live bots first (mutual exclusion).
+        live_stopped = _stop_all_live_bots()
 
-    cmd = [sys.executable, str(SCRIPT_DIR / "universal_downloader.py")]
-    if performer:
-        cmd.append(performer)
-    else:
-        cmd.append("--all")
+        # Optional: specific performer
+        try:
+            body = request.get_json(silent=True) or {}
+        except Exception:
+            body = {}
+        performer = body.get("performer")
 
-    try:
-        proc = subprocess.Popen(
-            cmd, cwd=str(SCRIPT_DIR),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        cmd = [sys.executable, str(SCRIPT_DIR / "universal_downloader.py")]
+        if performer:
+            cmd.append(performer)
+        else:
+            cmd.append("--all")
 
-    with _state_lock:
-        _state["running"] = True
-        _state["pid"] = proc.pid
-        _state["started_at"] = datetime.now().isoformat()
-        _state["current_performer"] = performer or "(all)"
-        _runner_thread = proc
-    return jsonify({"ok": True, "pid": proc.pid})
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(SCRIPT_DIR),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+
+        with _state_lock:
+            _state["running"] = True
+            _state["pid"] = proc.pid
+            _state["started_at"] = datetime.now().isoformat()
+            _state["current_performer"] = performer or "(all)"
+            _runner_thread = proc
+    return jsonify({"ok": True, "pid": proc.pid, "live_stopped": live_stopped})
 
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
-    global _runner_thread
-    with _state_lock:
-        proc = _runner_thread
-    if not proc:
-        return jsonify({"error": "not running"}), 400
-    try:
-        # On Windows, terminate kills the process tree
-        if sys.platform == "win32":
-            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                          capture_output=True, timeout=10)
-        else:
-            proc.terminate()
-        proc.wait(timeout=10)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-    with _state_lock:
-        _state["running"] = False
-        _state["pid"] = None
-        _runner_thread = None
-    return jsonify({"ok": True})
+    """Stop the archive subprocess. Always clears _progress.json's running
+    flag so the UI updates immediately — otherwise the front-end keeps
+    showing 'probing' even after the process is dead, and Start stays
+    disabled. Also handles the case where the subprocess was started from
+    the CLI (not by us) by reading the PID out of _progress.json."""
+    # _kill_archive_subprocess is idempotent — it kills our tracked process
+    # AND any external PID found in _progress.json, then clears the flag.
+    killed = _kill_archive_subprocess(timeout=10.0)
+    if not killed and not _archive_is_running():
+        # Nothing was running and nothing was killed — but also nothing's
+        # stuck. Still return OK so the UI can re-enable Start cleanly.
+        return jsonify({"ok": True, "was_running": False})
+    return jsonify({"ok": True, "was_running": True, "killed": killed})
 
 
 @app.route("/api/disk")
@@ -4454,13 +4633,21 @@ def api_live_remove():
 
 @app.route("/api/live/start", methods=["POST"])
 def api_live_start():
+    """Start one Live bot. Mutual exclusion: kills any running Archive
+    subprocess first so the two don't fight for bandwidth/disk."""
     if not _live:
         return jsonify({"error": "live recording unavailable"}), 503
     body = request.get_json(force=True) or {}
-    try:
-        r = _live.start_model(body.get("username", ""), body.get("site", ""))
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    archive_killed = False
+    with _mode_lock:
+        if _archive_is_running():
+            archive_killed = _kill_archive_subprocess(timeout=10.0)
+        try:
+            r = _live.start_model(body.get("username", ""), body.get("site", ""))
+        except Exception as e:
+            return jsonify({"error": str(e)}), 400
+    if archive_killed and isinstance(r, dict):
+        r["archive_killed"] = True
     return jsonify(r)
 
 
@@ -4493,10 +4680,20 @@ def api_live_pause():
 
 @app.route("/api/live/toggle_all", methods=["POST"])
 def api_live_toggle_all():
+    """Start/stop all Live bots. When starting, kills any running Archive
+    subprocess first (mutual exclusion). Stopping is a no-op for Archive."""
     if not _live:
         return jsonify({"error": "live recording unavailable"}), 503
     body = request.get_json(force=True) or {}
-    return jsonify(_live.toggle_all(bool(body.get("running", True))))
+    running = bool(body.get("running", True))
+    archive_killed = False
+    with _mode_lock:
+        if running and _archive_is_running():
+            archive_killed = _kill_archive_subprocess(timeout=10.0)
+        result = _live.toggle_all(running)
+    if archive_killed and isinstance(result, dict):
+        result["archive_killed"] = True
+    return jsonify(result)
 
 
 @app.route("/api/live/repair", methods=["POST"])

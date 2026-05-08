@@ -79,8 +79,12 @@ class BongaCams(Bot):
                 self.username = actual_username
                 self.logger = self.getLogger()
                 
-            # Check show type
-            show_type = performer_data.get('showType', '').lower()
+            # Check show type. .get(key, '') returns the default ONLY when
+            # the key is missing — if the key is present with value None
+            # (which BongaCams DOES return for some performers like
+            # "nastysoul"), .get returns None and .lower() crashes with
+            # "NoneType has no attribute 'lower'". Coerce via `or ''`.
+            show_type = (performer_data.get('showType') or '').lower()
             if show_type in ['private', 'group']:
                 return Status.PRIVATE
                 
@@ -116,7 +120,7 @@ class BongaCams(Bot):
             self.logger.error(f"Error parsing response: {e}")
             return Status.ERROR
         except Exception as e:
-            self.logger.error(f"Unexpected error: {e}")
+            self.logger.error(f"Unexpected error [{type(e).__name__}]: {e!r}")
             return Status.ERROR
 
     def isMobile(self) -> bool:

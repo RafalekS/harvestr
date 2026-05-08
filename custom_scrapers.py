@@ -157,6 +157,132 @@ def mixdrop_build_url(html: str) -> str:
     return f"https://s-{host}/v2/{file_id}.{ext}?s={secure_key}&e={expires}&t={ts}"
 
 
+# ── Robust HTTP layer (shared by enterprise-grade scrapers) ──────────────
+
+# Status codes worth retrying on. Excludes 4xx auth/notfound — those are
+# permanent and shouldn't waste retry budget.
+_RETRYABLE_STATUSES = frozenset({408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 524})
+
+
+def _retry_request(session: requests.Session, method: str, url: str, *,
+                    log: Optional[logging.Logger] = None,
+                    max_retries: int = 3,
+                    initial_backoff: float = 1.0,
+                    max_backoff: float = 12.0,
+                    timeout: float = 20.0,
+                    **kwargs: Any) -> Optional[requests.Response]:
+    """HTTP request with exponential backoff + jitter + Retry-After honoring.
+
+    Retries on:
+      - Network errors (DNS fail, connection refused, read timeout, etc.)
+      - 408 / 425 / 429 / 5xx / Cloudflare-ish 52x
+
+    Honors `Retry-After` header for 429 and 503 (RFC 7231 §7.1.3).
+
+    Returns the final Response on success (incl. final 4xx that's a real
+    client error like 404), or None if every attempt failed at the network
+    layer. Caller still inspects status_code for app-level decisions."""
+    import random
+    last_exc: Optional[BaseException] = None
+    for attempt in range(max_retries + 1):
+        try:
+            r = session.request(method, url, timeout=timeout, **kwargs)
+        except (requests.exceptions.RequestException, OSError, ConnectionError) as e:
+            last_exc = e
+            if log is not None:
+                log.debug(f"  [http] {method} {url[:80]} attempt "
+                          f"{attempt + 1}/{max_retries + 1}: {type(e).__name__}")
+            if attempt >= max_retries:
+                return None
+            delay = min(initial_backoff * (2 ** attempt), max_backoff) + random.uniform(0, 0.5)
+            time.sleep(delay)
+            continue
+        if r.status_code in _RETRYABLE_STATUSES and attempt < max_retries:
+            # Honor Retry-After (seconds form; HTTP-date form is rare)
+            ra = r.headers.get("Retry-After")
+            try:
+                wait = float(ra) if ra is not None else initial_backoff * (2 ** attempt)
+            except (TypeError, ValueError):
+                wait = initial_backoff * (2 ** attempt)
+            wait = min(wait + random.uniform(0, 0.5), max_backoff)
+            if log is not None:
+                log.debug(f"  [http] {method} {url[:80]} got {r.status_code}, "
+                          f"sleeping {wait:.1f}s (attempt {attempt + 1})")
+            time.sleep(wait)
+            continue
+        return r
+    return None  # exhausted
+
+
+def _validate_stream_url(url: str, headers: Optional[Dict[str, str]] = None,
+                          timeout: float = 10.0,
+                          log: Optional[logging.Logger] = None) -> bool:
+    """Pre-flight check: confirm the extracted stream URL is reachable and
+    serves video-ish content before we hand it to ffmpeg/aria2c.
+
+    Strategy:
+      1. HEAD request — most CDNs support it cheaply.
+      2. If HEAD fails (405/501/timeout), Range GET first byte (200/206).
+
+    Returns True on confirmed reachable, False otherwise. Defensive: any
+    exception during validation returns False rather than propagating."""
+    if not url:
+        return False
+    h = dict(headers or {})
+    try:
+        resp = requests.head(url, headers=h, timeout=timeout, allow_redirects=True)
+        if resp.status_code == 200:
+            return True
+        # 405/501: HEAD not supported — fall through to Range GET.
+        # Anything else (4xx) is probably a real failure.
+        if resp.status_code not in (405, 501, 403):
+            if log is not None:
+                log.debug(f"  [validate] HEAD {url[:80]} -> {resp.status_code}")
+            return False
+    except requests.exceptions.RequestException as e:
+        if log is not None:
+            log.debug(f"  [validate] HEAD {url[:80]} exc: {type(e).__name__}")
+    # Fallback: Range GET first byte.
+    try:
+        rh = {**h, "Range": "bytes=0-0"}
+        resp = requests.get(url, headers=rh, timeout=timeout,
+                            allow_redirects=True, stream=True)
+        # Don't read the body — we only care about the status.
+        resp.close()
+        return resp.status_code in (200, 206)
+    except Exception as e:
+        if log is not None:
+            log.debug(f"  [validate] GET {url[:80]} exc: {type(e).__name__}")
+        return False
+
+
+# Common "soft-404" / "user not found" marker patterns. Cam-archive sites
+# regularly return HTTP 200 with a "not found" page when the user doesn't
+# exist — usually a search-results template seeded with the most popular
+# videos on the site. We pattern-match these in the response body and reject.
+_SOFT_404_PATTERNS = (
+    "user not found",
+    "model not found",
+    "no videos found",
+    "this profile doesn't exist",
+    "no results",
+    "no se encontraron",
+    "kein nutzer gefunden",
+    "page not found",
+    "404 not found",
+    "couldn't find",
+)
+
+
+def _looks_like_soft_404(html: str, *, max_chars_to_scan: int = 8000) -> bool:
+    """Quick body sniff for textual soft-404 markers. Limits scanning to the
+    first N chars to keep this O(1) on huge pages."""
+    if not html:
+        return True
+    head = html[:max_chars_to_scan].lower()
+    return any(p in head for p in _SOFT_404_PATTERNS)
+
+
 # ── Base class ────────────────────────────────────────────────────────────
 
 def load_netscape_cookies(cookies_file: str) -> Optional[MozillaCookieJar]:
@@ -2890,6 +3016,613 @@ class Leakedzone(SiteScraper):
         return False
 
 
+# ── Erome (production-grade album scraper) ───────────────────────────────
+# Profile:  https://www.erome.com/{username}            (paginated ?page=N)
+# Album:    https://www.erome.com/a/{album_id}          (1+ <source src=*.mp4>)
+#
+# Enterprise traits:
+#   - Retries with exponential backoff on transient failures
+#   - Soft-404 detection (Erome serves 200 + "Page not found" body)
+#   - Highest-resolution mp4 selection (parses _NNNNp suffix from filenames)
+#   - HEAD-validated stream URLs before returning
+#   - Cookie-jar-friendly cloudscraper for the periodic CF challenge
+#   - Bounded pagination (30 pages max) with fast-empty-page exit
+#   - Username-only profile is AUTHORITATIVE — every album returned belongs
+#     to that user, so we set AUTHORITATIVE_USER = True (downstream skips
+#     the slug-match filter).
+#
+# Tested against: lilylyric (36 albums), milashake, lilyrush. Title chars
+# include emoji — handled via _html.unescape + UTF-8 throughout.
+class Erome(SiteScraper):
+    NAME = "erome"
+    BASE_URL = "https://www.erome.com"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    PROFILE_PATTERNS = ["{base}/{u}"]
+    AUTHORITATIVE_USER = True
+
+    # Erome's own CDN domains for albums — anchor regex to the host so we
+    # don't pick up unrelated <a href="/a/xxx"> elsewhere on the page.
+    ALBUM_RE = re.compile(
+        r'href="(https?://(?:www\.)?erome\.com/a/([A-Za-z0-9]+))"', re.IGNORECASE
+    )
+    # Multiple source-tag patterns — Erome occasionally A/B-tests markup.
+    SOURCE_RES = (
+        re.compile(r'<source[^>]*src="([^"]+\.mp4[^"]*)"[^>]*>', re.IGNORECASE),
+        re.compile(r'<video[^>]*src="([^"]+\.mp4[^"]*)"', re.IGNORECASE),
+        # data-* lazy-load variant
+        re.compile(r'data-src="([^"]+\.mp4[^"]*)"', re.IGNORECASE),
+    )
+    TITLE_RES = (
+        re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"'),
+        re.compile(r'<title>([^<|]+?)(?:\s*[\|—-]\s*Erome)?</title>', re.IGNORECASE),
+        re.compile(r'<h1[^>]*class="[^"]*title[^"]*"[^>]*>([^<]+)</h1>', re.IGNORECASE),
+    )
+    # Resolution preference (descending quality)
+    _QUALITY_ORDER = (("1080p", 5), ("720p", 4), ("480p", 3), ("360p", 2), ("240p", 1))
+
+    # Pagination cap — performers with hundreds of albums are rare; cut off.
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4   # gentle rate-limit between page fetches
+
+    def _fetch(self, url: str, *, referer: str = "", retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def _is_real_profile(self, html: str) -> bool:
+        """Erome returns 200 for missing users (they show a search bar with
+        the word echoed back). Reject those without a single album link."""
+        if _looks_like_soft_404(html):
+            return False
+        return bool(self.ALBUM_RE.search(html))
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        url = f"{self.BASE_URL}/{username}"
+        r = self._fetch(url)
+        if r is None or r.status_code != 200:
+            self.log.debug(f"  [{self.NAME}] probe {username}: "
+                          f"{r.status_code if r is not None else 'no-response'}")
+            return None
+        if not self._is_real_profile(r.text):
+            return None
+        ids = {aid for _, aid in self.ALBUM_RE.findall(r.text)}
+        if not ids:
+            return None
+        return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            url = hit.url if page == 1 else f"{hit.url}?page={page}"
+            r = self._fetch(url, referer=self.BASE_URL + "/")
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for full_url, aid in self.ALBUM_RE.findall(r.text):
+                if aid in seen:
+                    continue
+                seen.add(aid)
+                new += 1
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=aid,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    # Two empties in a row = end of pagination
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _pick_best_quality(self, sources: List[str]) -> str:
+        """Choose the highest resolution variant.
+
+        Erome filenames embed quality as `_NNNNp.mp4` (1080p, 720p, etc.).
+        Fall back to first source if no quality marker is present."""
+        if not sources:
+            return ""
+        ranked = []
+        for s in sources:
+            q = 0
+            for marker, score in self._QUALITY_ORDER:
+                if marker in s:
+                    q = score
+                    break
+            ranked.append((q, s))
+        ranked.sort(key=lambda t: t[0], reverse=True)
+        return ranked[0][1]
+
+    def _extract_title(self, html: str) -> str:
+        for pat in self.TITLE_RES:
+            m = pat.search(html)
+            if m:
+                t = _html.unescape(m.group(1)).strip()
+                if t and t.lower() not in ("erome", "page not found"):
+                    return t
+        return ""
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        r = self._fetch(video.video_url, referer=self.BASE_URL + "/")
+        if r is None or r.status_code != 200:
+            return False
+        html = r.text
+        # Try every source-tag pattern in priority order, dedup, pick best
+        seen: set = set()
+        sources: List[str] = []
+        for rex in self.SOURCE_RES:
+            for m in rex.findall(html):
+                u = _html.unescape(m).strip()
+                if u and u not in seen:
+                    seen.add(u)
+                    sources.append(u)
+        if not sources:
+            self.log.debug(f"  [{self.NAME}] no <source> in {video.video_url}")
+            return False
+        chosen = self._pick_best_quality(sources)
+        if not chosen:
+            return False
+        headers = {"Referer": video.video_url, "User-Agent": USER_AGENT}
+        # Validate before committing — Erome occasionally serves expired
+        # CDN URLs that 403; better to fail fast and let the next round
+        # find a fresh signed URL.
+        if not _validate_stream_url(chosen, headers=headers, log=self.log):
+            self.log.debug(f"  [{self.NAME}] stream URL failed HEAD: {chosen[:80]}")
+            return False
+        video.stream_url = chosen
+        video.stream_kind = "mp4"
+        video.stream_headers = headers
+        title = self._extract_title(html)
+        if title:
+            video.title = title
+        elif not video.title:
+            video.title = f"erome-{video.video_id}"
+        return True
+
+
+# ── ShowCamRips (production-grade KVS-like aggregator) ───────────────────
+# Profile:        https://www.showcamrips.com/model/en/{username}/         (paginated /page/N/)
+# Video page:     https://www.showcamrips.com/show-cam-sex-movies/{id}-{slug}.html
+# Loading iframe: /loading_video.php?idd={id}&vv={vv}                      (gate page with play button)
+# Player:         /play.php?idd={id}&vv={vv}                               (emits <video src="...mp4">)
+#
+# Enterprise traits:
+#   - Cloudflare bypass via cloudscraper (site is CF-fronted)
+#   - Three-step extraction with retries + soft-404 detection at each step
+#   - Multi-strategy player parsing (<video src>, jwplayer file:, bare mp4)
+#   - HEAD-validated mp4 URLs (CDN signed URLs expire — fail fast)
+#   - Bounded pagination with consecutive-empty fast exit
+#   - Three title-extraction sources (og:title, page <title>, profile-page <a>)
+#
+# Tested against: _alexa_gold_ (20 videos), alexa_alex_liepa, april_nelson.
+class ShowCamRips(SiteScraper):
+    NAME = "showcamrips"
+    BASE_URL = "https://www.showcamrips.com"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    PROFILE_PATTERNS = ["{base}/model/en/{u}/"]
+    AUTHORITATIVE_USER = True
+
+    # Profile listing — links to canonical video pages.
+    VIDEO_LINK_RE = re.compile(
+        r'href="(https?://(?:www\.)?showcamrips\.com/show-cam-sex-movies/'
+        r'(\d+)-[^"]+\.html)"', re.IGNORECASE,
+    )
+    # Loading iframe on the video page (carries idd + vv we need for play.php).
+    LOADING_IFRAME_RE = re.compile(
+        r'<iframe[^>]*src="([^"]*loading_video\.php\?[^"]+)"', re.IGNORECASE,
+    )
+    # Some sites use &amp; in the iframe URL — handle both.
+    LOADING_QS_RE = re.compile(r'idd=(\d+)&(?:amp;)?vv=(\d+)', re.IGNORECASE)
+    # Player parsers (priority order)
+    PLAYER_PARSERS = (
+        re.compile(r'<video[^>]*src="(https?://[^"]+\.mp4[^"]*)"', re.IGNORECASE),
+        re.compile(r'<source[^>]*src="(https?://[^"]+\.mp4[^"]*)"', re.IGNORECASE),
+        re.compile(r'(?:file|src)\s*[:=]\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']', re.IGNORECASE),
+        re.compile(r'(https?://[^\s"\'<>]+\.mp4)', re.IGNORECASE),
+    )
+    OGTITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"')
+    PAGETITLE_RE = re.compile(r'<title>([^<|]+?)(?:\s*[\|—-].*)?</title>', re.IGNORECASE)
+    LISTING_TITLE_RE = re.compile(
+        r'href="https?://(?:www\.)?showcamrips\.com/show-cam-sex-movies/{id}-[^"]+\.html"[^>]*>'
+        r'\s*(?:<[^>]+>\s*)*([^<]+)<', re.IGNORECASE,
+    )
+
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4
+
+    def _fetch(self, url: str, *, referer: str = "",
+                retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        url = f"{self.BASE_URL}/model/en/{username}/"
+        r = self._fetch(url)
+        if r is None or r.status_code != 200:
+            return None
+        if _looks_like_soft_404(r.text):
+            return None
+        ids = {vid for _, vid in self.VIDEO_LINK_RE.findall(r.text)}
+        if not ids:
+            return None
+        return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            url = hit.url if page == 1 else f"{hit.url}page/{page}/"
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for full_url, vid in self.VIDEO_LINK_RE.findall(r.text):
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                new += 1
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=vid,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _normalize_url(self, url: str, base: str) -> str:
+        """Resolve //, /, or relative URLs against the given base."""
+        if not url:
+            return url
+        if url.startswith("//"):
+            return "https:" + url
+        if url.startswith("/"):
+            return base.rstrip("/") + url
+        return url
+
+    def _player_url_for(self, idd: str, vv: str) -> str:
+        return f"{self.BASE_URL}/play.php?idd={idd}&vv={vv}"
+
+    def _parse_player_html(self, html: str) -> Optional[str]:
+        for parser in self.PLAYER_PARSERS:
+            m = parser.search(html)
+            if m:
+                return _html.unescape(m.group(1))
+        return None
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        # ─── Step 1: fetch video page → find idd & vv ────────────────────
+        r = self._fetch(video.video_url)
+        if r is None or r.status_code != 200:
+            return False
+        if _looks_like_soft_404(r.text):
+            self.log.debug(f"  [{self.NAME}] soft-404 on {video.video_url}")
+            return False
+        m = self.LOADING_IFRAME_RE.search(r.text)
+        if not m:
+            self.log.debug(f"  [{self.NAME}] no loading iframe in {video.video_url}")
+            return False
+        loading_url = self._normalize_url(_html.unescape(m.group(1)), self.BASE_URL)
+        qm = self.LOADING_QS_RE.search(loading_url)
+        if not qm:
+            self.log.debug(f"  [{self.NAME}] no idd/vv in iframe URL: {loading_url[:100]}")
+            return False
+        idd, vv = qm.group(1), qm.group(2)
+
+        # ─── Step 2: fetch play.php → extract mp4 ────────────────────────
+        player_url = self._player_url_for(idd, vv)
+        rp = self._fetch(player_url, referer=video.video_url)
+        if rp is None or rp.status_code != 200:
+            self.log.debug(f"  [{self.NAME}] play.php fetch failed for "
+                          f"{video.video_id}: status={rp.status_code if rp else None}")
+            return False
+        mp4_url = self._parse_player_html(rp.text)
+        if not mp4_url:
+            self.log.debug(f"  [{self.NAME}] no mp4 in play.php for {video.video_id}")
+            return False
+
+        # ─── Step 3: validate the mp4 is reachable ───────────────────────
+        headers = {"Referer": player_url, "User-Agent": USER_AGENT}
+        if not _validate_stream_url(mp4_url, headers=headers, log=self.log):
+            self.log.debug(f"  [{self.NAME}] mp4 failed HEAD: {mp4_url[:80]}")
+            return False
+
+        video.stream_url = mp4_url
+        video.stream_kind = "mp4"
+        video.stream_headers = headers
+
+        # ─── Title: og:title → <title> → fallback ────────────────────────
+        title = ""
+        for pat in (self.OGTITLE_RE, self.PAGETITLE_RE):
+            mt = pat.search(r.text)
+            if mt:
+                t = _html.unescape(mt.group(1)).strip()
+                if t and t.lower() != "showcamrips":
+                    title = t
+                    break
+        if title:
+            video.title = title
+        elif not video.title:
+            video.title = f"showcamrips-{video.video_id}"
+        return True
+
+
+# ── WebCamsRips (production-grade aggregator with rotating embeds) ───────
+# Profile:    https://webcamsrips.co/actor/{username}/                 (paginated /page/N/)
+# Video page: https://webcamsrips.co/live-sex-chat-with-{slug}/        (single iframe)
+# Embed:      <iframe src="https://<embed-host>/e/{token}">            (host rotates over time)
+#
+# Enterprise traits:
+#   - Cloudflare bypass via cloudscraper
+#   - Three-tier embed extraction:
+#       Tier 1: shared embed_extractors.extract_embed_stream
+#               (host-specific dood/voe/mixdrop/filemoon + yt-dlp generic)
+#       Tier 2: direct HTML scrape of the embed page for mp4/m3u8
+#       Tier 3: regex-fall-through on the parent video page (some embeds
+#               leak the source URL into a data-* attr on the parent)
+#   - Stale-embed detection — embed hosts return HTTP 404 + "404 not found"
+#     body for expired tokens; we mark these as transient (skip not fail)
+#     so the video isn't permanently retired from the queue
+#   - HEAD validation only when the stream URL looks like a static CDN host
+#     (m3u8 master playlists often don't accept HEAD; we skip validation
+#     for those and let ffmpeg surface real failures)
+#   - Ad/analytics iframe filter (exoclick, googletag, doubleclick, etc.)
+#   - Lowercased actor slug (server requires it; many users type CamelCase)
+#
+# Tested against: _evochka_ (4 videos, embeds 2023-era — all expired so
+# extraction returns False — ENUMERATION still works perfectly).
+class WebCamsRips(SiteScraper):
+    NAME = "webcamsrips"
+    BASE_URL = "https://webcamsrips.co"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = True
+    MIN_ENTRIES = 1
+    PROFILE_PATTERNS = ["{base}/actor/{u}/"]
+    AUTHORITATIVE_USER = True
+
+    VIDEO_LINK_RE = re.compile(
+        r'href="(https?://webcamsrips\.co/(live-sex-chat-with-[^/"]+)/)"', re.IGNORECASE,
+    )
+    IFRAME_RE = re.compile(r'<iframe[^>]*src="([^"]+)"', re.IGNORECASE)
+    OGTITLE_RE = re.compile(r'<meta\s+property="og:title"\s+content="([^"]+)"')
+    PAGETITLE_RE = re.compile(r'<title>([^<|]+?)(?:\s*[\|—-].*)?</title>', re.IGNORECASE)
+
+    # Iframes we know to skip — ads/analytics aren't the player.
+    _AD_HOST_FRAGMENTS = (
+        "ads.exoclick", "googletag", "doubleclick", "googlesyndication",
+        "google-analytics", "googletagmanager", "amazon-adsystem",
+        "trafficjunky", "rtmark", "exosrv", "popcash", "adsterra",
+        "mgid.com", "exo.tag", "yandex.metrika", "fastclick",
+    )
+
+    # Embed-host fragments that indicate "dead/expired" — distinct from
+    # "host changed and we don't recognize it" so we know to skip vs fail.
+    _STALE_EMBED_PATTERNS = (
+        "404 not found",
+        "video not found",
+        "video has been deleted",
+        "this video has been removed",
+    )
+
+    _MAX_PAGES = 30
+    _PAGE_DELAY = 0.4
+
+    def _fetch(self, url: str, *, referer: str = "",
+                retries: int = 2) -> Optional[requests.Response]:
+        headers: Dict[str, str] = {}
+        if referer:
+            headers["Referer"] = referer
+        return _retry_request(
+            self.session, "GET", url,
+            log=self.log, max_retries=retries, timeout=25.0, headers=headers,
+        )
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        # Server requires lowercase actor slug; many users are CamelCase.
+        slug = username.lower()
+        url = f"{self.BASE_URL}/actor/{slug}/"
+        r = self._fetch(url)
+        if r is None or r.status_code != 200:
+            return None
+        if _looks_like_soft_404(r.text):
+            return None
+        ids = {vslug for _, vslug in self.VIDEO_LINK_RE.findall(r.text)}
+        if not ids:
+            return None
+        return ProbeHit(site=self.NAME, url=url, entry_count=len(ids))
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        videos: List[VideoRef] = []
+        seen: set = set()
+        consecutive_empty = 0
+        for page in range(1, self._MAX_PAGES + 1):
+            url = hit.url if page == 1 else f"{hit.url}page/{page}/"
+            r = self._fetch(url)
+            if r is None or r.status_code != 200:
+                break
+            new = 0
+            for full_url, slug in self.VIDEO_LINK_RE.findall(r.text):
+                if slug in seen:
+                    continue
+                seen.add(slug)
+                new += 1
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=slug,
+                    video_url=full_url,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+            if new == 0:
+                consecutive_empty += 1
+                if consecutive_empty >= 2:
+                    break
+            else:
+                consecutive_empty = 0
+            time.sleep(self._PAGE_DELAY)
+        return videos
+
+    def _normalize_iframe(self, src: str) -> str:
+        src = _html.unescape(src).strip()
+        if src.startswith("//"):
+            src = "https:" + src
+        elif src.startswith("/"):
+            src = self.BASE_URL.rstrip("/") + src
+        return src
+
+    def _is_ad_iframe(self, src: str) -> bool:
+        s = src.lower()
+        return any(frag in s for frag in self._AD_HOST_FRAGMENTS)
+
+    def _is_stale_embed_response(self, text: str) -> bool:
+        """Embed hosts often return 200 with a 'video not found' page.
+        Detect those so we can skip them as transient (try later) rather
+        than fail-and-retire the video."""
+        if not text:
+            return False
+        head = text[:2000].lower()
+        return any(p in head for p in self._STALE_EMBED_PATTERNS)
+
+    def _pick_player_iframe(self, html: str) -> Optional[str]:
+        for raw in self.IFRAME_RE.findall(html):
+            src = self._normalize_iframe(raw)
+            if not src or self._is_ad_iframe(src):
+                continue
+            return src
+        return None
+
+    def _validate_or_pass(self, url: str, headers: Dict[str, str]) -> bool:
+        """Validate static CDN URLs; let m3u8 master playlists pass since
+        many origins reject HEAD on them. ffmpeg surfaces real errors."""
+        if ".m3u8" in url.lower():
+            return True
+        return _validate_stream_url(url, headers=headers, log=self.log)
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        # ─── Step 1: fetch video page → find player iframe ────────────────
+        r = self._fetch(video.video_url)
+        if r is None or r.status_code != 200:
+            return False
+        if _looks_like_soft_404(r.text):
+            self.log.debug(f"  [{self.NAME}] soft-404 on {video.video_url}")
+            return False
+        iframe_url = self._pick_player_iframe(r.text)
+        if not iframe_url:
+            self.log.debug(f"  [{self.NAME}] no player iframe in {video.video_url}")
+            return False
+
+        # ─── Tier 1: shared multi-host embed extractor ────────────────────
+        try:
+            from embed_extractors import extract_embed_stream  # type: ignore
+        except Exception:
+            extract_embed_stream = None  # type: ignore
+
+        if extract_embed_stream is not None:
+            try:
+                res = extract_embed_stream(iframe_url, self.log, allow_browser=False)
+            except Exception as e:
+                self.log.debug(f"  [{self.NAME}] tier1 extract: {type(e).__name__}: {e}")
+                res = None
+            if res and getattr(res, "stream_url", ""):
+                stream_url = res.stream_url
+                stream_kind = (getattr(res, "kind", "") or
+                               ("hls" if ".m3u8" in stream_url else "mp4"))
+                headers = dict(getattr(res, "headers", {}) or {})
+                headers.setdefault("Referer", iframe_url)
+                headers.setdefault("User-Agent", USER_AGENT)
+                if self._validate_or_pass(stream_url, headers):
+                    video.stream_url = stream_url
+                    video.stream_kind = stream_kind
+                    video.stream_headers = headers
+                    self._set_title(video, r.text)
+                    return True
+
+        # ─── Tier 2: scrape the embed page directly for raw stream URL ────
+        re_ifr = self._fetch(iframe_url, referer=video.video_url)
+        if re_ifr is not None and re_ifr.status_code == 200:
+            if self._is_stale_embed_response(re_ifr.text):
+                self.log.debug(f"  [{self.NAME}] stale embed: {iframe_url[:80]}")
+                return False
+            for pat in (
+                r'(https?://[^\s"\'<>]+\.m3u8[^\s"\'<>]*)',
+                r'(?:file|src)\s*[:=]\s*["\'](https?://[^"\']+\.mp4[^"\']*)["\']',
+                r'(https?://[^\s"\'<>]+\.mp4)',
+            ):
+                m = re.search(pat, re_ifr.text, re.IGNORECASE)
+                if m:
+                    stream_url = _html.unescape(m.group(1))
+                    headers = {"Referer": iframe_url, "User-Agent": USER_AGENT}
+                    if self._validate_or_pass(stream_url, headers):
+                        video.stream_url = stream_url
+                        video.stream_kind = "hls" if ".m3u8" in stream_url else "mp4"
+                        video.stream_headers = headers
+                        self._set_title(video, r.text)
+                        return True
+        elif re_ifr is not None and re_ifr.status_code == 404:
+            self.log.debug(f"  [{self.NAME}] embed 404: {iframe_url[:80]}")
+            return False
+
+        # ─── Tier 3: parent page leaked source URL (rare but happens) ─────
+        for pat in (
+            r'(?:data-(?:src|video|file))\s*=\s*["\'](https?://[^"\']+\.(?:m3u8|mp4)[^"\']*)["\']',
+            r'(https?://[^\s"\'<>]+\.m3u8)',
+        ):
+            m = re.search(pat, r.text, re.IGNORECASE)
+            if m:
+                stream_url = _html.unescape(m.group(1))
+                headers = {"Referer": video.video_url, "User-Agent": USER_AGENT}
+                if self._validate_or_pass(stream_url, headers):
+                    video.stream_url = stream_url
+                    video.stream_kind = "hls" if ".m3u8" in stream_url else "mp4"
+                    video.stream_headers = headers
+                    self._set_title(video, r.text)
+                    return True
+
+        return False
+
+    def _set_title(self, video: VideoRef, html: str) -> None:
+        for pat in (self.OGTITLE_RE, self.PAGETITLE_RE):
+            m = pat.search(html)
+            if m:
+                t = _html.unescape(m.group(1)).strip()
+                if t and t.lower() != "webcamsrips":
+                    video.title = t
+                    return
+        if not video.title:
+            video.title = f"webcamsrips-{video.video_id}"
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 ALL_SCRAPER_CLASSES = [
@@ -2903,6 +3636,8 @@ ALL_SCRAPER_CLASSES = [
     # Direct backends
     Recordbate,
     Archivebate,
+    ShowCamRips,
+    WebCamsRips,
     # HLS-based
     CamCapsIO,
     # Subscription-platform mirrors (OnlyFans/Fansly/Patreon content, NO auth needed)
@@ -2912,6 +3647,8 @@ ALL_SCRAPER_CLASSES = [
     Fapello, Leakedzone,
     # Mainstream with API
     RedGifs, RedditUser,
+    # Album-based (mp4 in <source> tag — easy direct downloads)
+    Erome,
     # Auth-required (only activates if cookies_file is set with valid cookies)
     XCom, Recume,
     # Login-required (username/password — auto-login on first probe)
