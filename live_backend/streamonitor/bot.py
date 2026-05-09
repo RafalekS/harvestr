@@ -271,16 +271,27 @@ class Bot(Thread):
                             Status.UNKNOWN, Status.NOTRUNNING)
             if self.sc in stale_states:
                 prev = self.sc
-                self.sc = Status.UNKNOWN
+                # 2026-05-09 critical: reset target is NOTRUNNING, not
+                # UNKNOWN. The main loop only calls getStatus() if
+                # `not self.bulk_update or self.sc == Status.NOTRUNNING`.
+                # Setting sc=UNKNOWN on a bulk-update bot (Chaturbate,
+                # StripChat-bulk, CamSoda) skips the getStatus() call —
+                # the bot expects BulkStatusManager to update it via
+                # setStatus(), but LiveManager doesn't run that manager.
+                # NOTRUNNING is the correct "I just started, please poll
+                # me" sentinel. The first main-loop iteration will call
+                # getStatus() and set a real status; from there the bot
+                # proceeds normally.
+                self.sc = Status.NOTRUNNING
                 self._consecutive_errors = 0
                 # Reset the offline-time accumulator so a bot that's
                 # been LONG_OFFLINE for hours doesn't immediately
                 # transition back to LONG_OFFLINE on the very next
                 # iteration. Pair with the wake event below.
                 self._offline_time = 0
-                if prev != Status.UNKNOWN:
+                if prev != Status.NOTRUNNING:
                     self.logger.verbose(
-                        f"Resetting stale state {prev.name} → UNKNOWN "
+                        f"Resetting stale state {prev.name} → NOTRUNNING "
                         "(forcing fresh status check)"
                     )
 

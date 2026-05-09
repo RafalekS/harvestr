@@ -350,6 +350,75 @@ class LiveManager:
         self.live_dir = self._resolve_live_dir()
         # On startup, reconstruct from config (do NOT auto-start — user clicks)
         self._restore()
+        # Spawn the bulk-status poller so bulk-update sites (Chaturbate,
+        # CamSoda, StripChat) get ongoing status checks. Without this,
+        # bulk-update bots only ever do a single getStatus() at startup
+        # (when sc==NOTRUNNING) and then never recheck — so models that
+        # weren't online at the exact moment of startup never get
+        # detected even when they go live later.
+        # Recording count was permanently stuck at whatever subset
+        # happened to be PUBLIC during the one-shot poll. (StreaMonitor's
+        # native CLI starts BulkStatusManager from main.py; LiveManager
+        # never adopted that piece, so we add a thin shim here.)
+        self._bulk_poller = self._start_bulk_poller()
+
+    def _start_bulk_poller(self):
+        """Start a daemon thread that calls each bulk-capable site's
+        `getStatusBulk(streamers)` classmethod every 10s, refreshing
+        every running bulk-update bot's `sc` from a single API call
+        per site instead of one per bot. Mirrors StreaMonitor's
+        BulkStatusManager but pulls live state from `self._models`
+        each tick so bots added/removed via the UI are picked up
+        without needing to restart the poller."""
+        if not available or Bot is None:
+            return None
+        import time as _time
+        try:
+            from streamonitor.bot import LOADED_SITES as _LOADED_SITES
+        except Exception as e:
+            log.warning(f"[live] bulk poller: cannot import LOADED_SITES: {e}")
+            return None
+
+        bulk_classes = frozenset(
+            cls for cls in _LOADED_SITES
+            if hasattr(cls, "getStatusBulk")
+            and getattr(cls, "bulk_update", False)
+        )
+        if not bulk_classes:
+            log.info("[live] bulk poller: no bulk-update sites loaded")
+            return None
+
+        def _loop() -> None:
+            log.info(f"[live] bulk poller started for: "
+                     f"{sorted(getattr(c, 'site', '?') for c in bulk_classes)}")
+            while True:
+                try:
+                    # Snapshot the running bots per bulk class
+                    by_class: Dict[type, set] = {}
+                    with self._lock:
+                        for rm in self._models.values():
+                            bot = rm.bot
+                            cls = bot.__class__
+                            if cls not in bulk_classes:
+                                continue
+                            if not getattr(bot, "running", False):
+                                continue
+                            by_class.setdefault(cls, set()).add(bot)
+                    # Poll each class's bulk endpoint
+                    for cls, bots in by_class.items():
+                        try:
+                            cls.getStatusBulk(bots)
+                        except Exception as e:
+                            log.debug(f"[live] bulk poll {getattr(cls, 'site', cls.__name__)}: "
+                                      f"{type(e).__name__}: {e}")
+                except Exception as e:
+                    log.debug(f"[live] bulk poller iter: {type(e).__name__}: {e}")
+                _time.sleep(10)
+
+        t = threading.Thread(target=_loop, name="live-bulk-poller",
+                             daemon=True)
+        t.start()
+        return t
 
     def _resolve_live_dir(self) -> Path:
         """Live recordings go to config.live.live_output_dir (if set) or
