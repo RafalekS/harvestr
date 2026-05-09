@@ -78,6 +78,26 @@ if _STREAMONITOR_PATH:
     try:
         if _STREAMONITOR_PATH not in sys.path:
             sys.path.insert(0, _STREAMONITOR_PATH)
+        # ── streamer-list config path (2026-05-09 fix) ──
+        # StreaMonitor's `streamonitor/config.py` originally hardcodes
+        # `config_loc = "config.json"` (relative). When Harvestr launches
+        # from `universal/`, that resolves to `universal/config.json` —
+        # which is the universal harvester's OWN config (a dict, not a
+        # streamer list), so loadStreamers() ends up with 0 streamers
+        # and the Live tab shows "0 MODELS TRACKED" even though the
+        # user has hundreds of streamers configured.
+        # Fix: pin StreaMonitor's config to a distinct absolute path
+        # next to the StreaMonitor module so it never collides. We
+        # prefer the user's existing data files in priority order:
+        #   1. STRMNTR_CONFIG_PATH already set by caller (no override)
+        #   2. <streamonitor_root>/config.json (the canonical location —
+        #      typically D:\F\StreaMonitor\config.json or
+        #      C:\F\StreaMonitor\config.json for users with an external
+        #      install; live_backend/config.json for vendored)
+        if not os.environ.get("STRMNTR_CONFIG_PATH"):
+            _stream_cfg = Path(_STREAMONITOR_PATH) / "config.json"
+            os.environ["STRMNTR_CONFIG_PATH"] = str(_stream_cfg)
+            log.info(f"  [live] StreaMonitor config: {_stream_cfg}")
         # Separate Live recordings from Archive downloads. Archive files
         # go to <output_dir>/<performer>/..., live recordings to
         # <live_output_dir>/<performer> [SITE]/N.mkv. By default

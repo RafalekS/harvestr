@@ -281,8 +281,13 @@ class CamSoda(Bot):
             return data
 
         except requests.exceptions.RequestException as e:
-            self.logger.error(f"Network error fetching info: {e}")
-            return {"__status__": Status.ERROR}
+            # 2026-05-09: was returning ERROR, but transient network
+            # failures should trigger adaptive backoff (RATELIMIT) so
+            # the bot doesn't keep retrying every poll cycle and spam
+            # the log with "Error on downloading".
+            self.logger.debug(f"Network error fetching info: "
+                               f"{type(e).__name__}: {e}")
+            return {"__status__": Status.RATELIMIT}
         except (TimeoutError, ConnectionError, OSError) as e:
             # curl_cffi (CFSessionManager) raises a parallel exception
             # tree from requests.exceptions — its TimeoutError /
@@ -290,8 +295,12 @@ class CamSoda(Bot):
             # requests.exceptions.RequestException. Without this catch,
             # transient socket failures fall through to the noisy
             # catch-all and are logged as ERROR instead of RATELIMIT.
+            # 2026-05-09: must wrap in {"__status__": ...} dict — the
+            # caller (getStatus) does `if "__status__" in data` which
+            # raises TypeError on a bare Status enum, sending the bot
+            # into an Exception path that gets coerced to ERROR.
             self.logger.debug(f"Network/timeout {type(e).__name__}: {e}")
-            return Status.RATELIMIT
+            return {"__status__": Status.RATELIMIT}
         except (KeyError, ValueError) as e:
             self.logger.error(f"Error parsing response: {e}")
             return {"__status__": Status.ERROR}

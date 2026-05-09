@@ -29,7 +29,11 @@ cookies.txt
 cookies_*.txt
 *.cookies.txt
 config.json
+config.json.*
 !config.example.json
+# Streamonitor's vendored config (live model list — usernames/room_ids)
+live_backend/config.json
+live_backend/config.json.*
 
 # State files — generated at runtime
 universal.log

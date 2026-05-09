@@ -1,4 +1,5 @@
 import json
+import os
 import sys
 import time
 
@@ -7,7 +8,14 @@ from streamonitor.bot import Bot
 import streamonitor.sites
 import streamonitor.log as log
 
-config_loc = "config.json"
+# 2026-05-09: when StreaMonitor runs vendored inside the Harvestr universal
+# harvester, the universal harvester's own `config.json` (a dict with
+# `performers`, `enabled_sites`, etc.) sits in the same cwd that StreaMonitor
+# would use for its `config.json` (a LIST of streamer dicts). They collide on
+# the same filename and StreaMonitor ends up with 0 streamers loaded.
+# The host (universal/live_recording.py) sets STRMNTR_CONFIG_PATH to a
+# distinct absolute path so the two configs never share a filename.
+config_loc = os.environ.get("STRMNTR_CONFIG_PATH", "config.json")
 logger = log.Logger("config")
 
 

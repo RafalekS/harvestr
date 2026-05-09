@@ -1102,9 +1102,40 @@ class StripChat(RoomIdBot):
         return bool(found) if found is not None else False
 
     def getStatus(self):
-        """Check the current status of the model's stream."""
+        """Check the current status of the model's stream.
+
+        2026-05-09: classify network/timeout exceptions as RATELIMIT
+        rather than letting them propagate to bot.py and become
+        Status.ERROR. ERROR doesn't trigger adaptive backoff so bots
+        that hit a transient network issue keep retrying every 30-40s
+        and spam the log with `Error on downloading` until something
+        clears. RATELIMIT triggers exponential backoff that gives the
+        connection pool time to recover.
+
+        Catches:
+          - requests.exceptions.RequestException (timeout, ConnectionError, etc.)
+          - curl_cffi's parallel exception tree (TimeoutError /
+            ConnectionError / DNSError / CurlError → all subclass OSError),
+            which doesn't inherit from RequestException
+          - Any unexpected exception → ERROR (so we still notice real bugs)
+        """
         url = f'https://stripchat.com/api/front/v2/models/username/{self.username}/cam?uniq={StripChat.uniq()}'
-        r = self.session.get(url, headers=self.headers, bucket='api')
+        try:
+            r = self.session.get(url, headers=self.headers, bucket='api')
+        except requests.exceptions.RequestException as e:
+            self.logger.debug(f'Network error for {self.username}: '
+                               f'{type(e).__name__}: {e}')
+            return Status.RATELIMIT
+        except (TimeoutError, ConnectionError, OSError) as e:
+            # curl_cffi exceptions (used by CFSessionManager) live in a
+            # parallel tree; same treatment as RequestException.
+            self.logger.debug(f'Network/timeout {type(e).__name__} for '
+                               f'{self.username}: {e}')
+            return Status.RATELIMIT
+        except Exception as e:
+            self.logger.error(f'Unexpected error fetching status for '
+                               f'{self.username} [{type(e).__name__}]: {e!r}')
+            return Status.ERROR
 
         ct = (r.headers.get("content-type") or "").lower()
         body = r.text or ""
@@ -1156,18 +1187,18 @@ class StripChat(RoomIdBot):
                           self._get_by_path(self.lastInfo, ["cam", "isCamAvailable"]) or False
         is_cam_active = self._get_by_path(self.lastInfo, ["isCamActive"]) or \
                        self._get_by_path(self.lastInfo, ["cam", "isCamActive"]) or False
-        
+
         # Only return PUBLIC if status is public AND camera is available AND active
         # This prevents downloading promotional videos when model is offline
         if status == "public" and is_cam_available and is_cam_active:
             return Status.PUBLIC
-        
+
         if status in self._PRIVATE_STATUSES:
             return Status.PRIVATE
-        
+
         if status in self._OFFLINE_STATUSES:
             return Status.OFFLINE
-        
+
         # Unknown status - log the actual data for debugging
         self.logger.warning(f"Unknown status '{status}' for {self.username} - lastInfo keys: {list(self.lastInfo.keys())}")
         self.logger.debug(f"Full response for {self.username}: {str(self.lastInfo)[:500]}")

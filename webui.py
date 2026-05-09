@@ -2134,6 +2134,33 @@ async function api(path, opts={}) {
   return r.json();
 }
 
+// 2026-05-09: defensive POST helper for handlers that just need
+// "did the server accept this" — not the parsed JSON body. Some browser
+// extensions (cookie-extractor, password managers) inject content
+// scripts that wrap fetch and break r.json() mid-promise, throwing
+// "Cannot read properties of undefined (reading 'useCache')". With the
+// regular api() helper that throw collapses callers' success branches
+// (toast, counter refresh, modal close) even though the POST itself
+// succeeded server-side. apiPostOk bypasses JSON parsing entirely and
+// returns a simple {ok, status, error} so callers can react to the
+// HTTP result without depending on response-body parsing.
+async function apiPostOk(path, body) {
+  let ok = false, status = 0, error = '';
+  try {
+    const r = await fetch(path, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: typeof body === 'string' ? body : JSON.stringify(body),
+    });
+    status = r.status;
+    ok = r.ok;
+    if (!r.ok) error = `HTTP ${r.status} ${r.statusText}`;
+  } catch (e) {
+    error = (e && e.message) || String(e);
+  }
+  return { ok, status, error };
+}
+
 // ── Status + live log ────────────────────────────────────────────────────
 async function refreshStatus() {
   try {
@@ -2435,15 +2462,36 @@ async function saveLiveSettings() {
     keep_last_n:      parseInt(g('cfg-live-keep-n').value)      || 0,
   };
   const merged = {..._config, live: liveCfg};
+  // Use raw fetch + manual status check rather than the api() helper.
+  // 2026-05-09: some browser extensions (cookie-extractor, password
+  // managers) inject content scripts that wrap fetch and throw
+  // `useCache` / "receiving end does not exist" errors mid-promise.
+  // The api() helper's `r.json()` call gets caught by that and the
+  // success branch never runs — so the modal stays open and no toast
+  // appears even though the POST itself succeeded server-side.
+  // Detect success via HTTP status alone, then run each UI update in
+  // its own try/catch so an extension-induced sync throw can't take
+  // out the whole chain.
+  let savedOK = false;
+  let errMsg = '';
   try {
-    await api('/api/config', {
-      method: 'POST', headers: {'Content-Type': 'application/json'},
+    const r = await fetch('/api/config', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
       body: JSON.stringify(merged),
     });
-    _config = merged;
-    toast('Live settings saved', 'success');
-    closeLiveSettings();
-  } catch(e) { toast('Error: ' + e.message, 'error'); }
+    savedOK = r.ok;
+    if (!r.ok) errMsg = `HTTP ${r.status} ${r.statusText}`;
+  } catch (e) {
+    errMsg = (e && e.message) || String(e);
+  }
+  if (savedOK) {
+    try { _config = merged; } catch(_) {}
+    try { toast('Live settings saved', 'success'); } catch(_) {}
+    try { closeLiveSettings(); } catch(_) {}
+  } else {
+    try { toast('Error: ' + errMsg, 'error'); } catch(_) {}
+  }
 }
 
 // ── History reset (danger zone) ───────────────────────────────────────
@@ -3271,57 +3319,58 @@ async function liveAdd() {
   const orig = btn.innerHTML;
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Resolving…';
-  try {
-    await api('/api/live/add', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, site})});
-    toast(`Tracking ${username} [${site}]`, 'success');
-    document.getElementById('live-new-username').value = '';
-    liveRefresh();
-  } catch(e) {
-    toast('Could not add: '+e.message, 'error');
-  } finally {
-    btn.disabled = false;
-    btn.innerHTML = orig;
+  const res = await apiPostOk('/api/live/add', {username, site});
+  if (res.ok) {
+    try { toast(`Tracking ${username} [${site}]`, 'success'); } catch(_){}
+    try { document.getElementById('live-new-username').value = ''; } catch(_){}
+    try { liveRefresh(); } catch(_){}
+  } else {
+    try { toast('Could not add: ' + res.error, 'error'); } catch(_){}
   }
+  try { btn.disabled = false; btn.innerHTML = orig; } catch(_){}
 }
 async function liveRemove(username, site) {
   if (!await confirmDialog(
         `Stop tracking <b>${escapeHtml(username)}</b> on <b>${escapeHtml(site)}</b>? Existing recorded files stay on disk.`,
         {title: 'Remove live model', tone: 'warn',
          confirmLabel: 'Remove', cancelLabel: 'Keep'})) return;
-  try {
-    await api('/api/live/remove', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, site})});
-    toast(`Removed ${username}`);
-    liveRefresh();
-  } catch(e) { toast('Error: '+e.message, 'error'); }
+  const res = await apiPostOk('/api/live/remove', {username, site});
+  if (res.ok) {
+    try { toast(`Removed ${username}`); } catch(_){}
+    try { liveRefresh(); } catch(_){}
+  } else {
+    try { toast('Error: ' + res.error, 'error'); } catch(_){}
+  }
 }
 async function liveStart(username, site) {
-  try {
-    await api('/api/live/start', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, site})});
-    toast(`Started ${username}`, 'success');
-    setTimeout(liveRefresh, 400);
-  } catch(e) { toast('Error: '+e.message, 'error'); }
+  const res = await apiPostOk('/api/live/start', {username, site});
+  if (res.ok) {
+    try { toast(`Started ${username}`, 'success'); } catch(_){}
+    try { setTimeout(liveRefresh, 400); } catch(_){}
+  } else {
+    try { toast('Error: ' + res.error, 'error'); } catch(_){}
+  }
 }
 async function liveStop(username, site) {
-  try {
-    await api('/api/live/stop', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, site})});
-    toast(`Stopped ${username}`);
-    setTimeout(liveRefresh, 400);
-  } catch(e) { toast('Error: '+e.message, 'error'); }
+  const res = await apiPostOk('/api/live/stop', {username, site});
+  if (res.ok) {
+    try { toast(`Stopped ${username}`); } catch(_){}
+    try { setTimeout(liveRefresh, 400); } catch(_){}
+  } else {
+    try { toast('Error: ' + res.error, 'error'); } catch(_){}
+  }
 }
 async function livePause(username, site) {
   // Soft-stop: keep the model in the tracking list but stop polling.
   // Resume via the Start button. Backend just calls stop() without
   // removing — same endpoint, different UX framing.
-  try {
-    await api('/api/live/pause', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({username, site})});
-    toast(`Paused ${username}`);
-    setTimeout(liveRefresh, 400);
-  } catch(e) { toast('Error: '+e.message, 'error'); }
+  const res = await apiPostOk('/api/live/pause', {username, site});
+  if (res.ok) {
+    try { toast(`Paused ${username}`); } catch(_){}
+    try { setTimeout(liveRefresh, 400); } catch(_){}
+  } else {
+    try { toast('Error: ' + res.error, 'error'); } catch(_){}
+  }
 }
 async function liveOpenFolder(username, siteSlug) {
   // Recordings live at live_dir/<username> [SLUG]/

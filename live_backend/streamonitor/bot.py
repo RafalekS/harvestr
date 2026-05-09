@@ -154,6 +154,17 @@ class Bot(Thread):
         self._consecutive_errors: int = 0
         self._max_consecutive_errors: int = 20
 
+        # 2026-05-09: wake-from-sleep + offline-timer reset support.
+        # `_wake_event` lets `restart()` interrupt a sleep that would
+        # otherwise tie up the bot for `sleep_on_long_offline` (10+ min)
+        # or `sleep_on_ratelimit` (exponential). `_offline_time` is the
+        # accumulator that decides when a bot transitions OFFLINE →
+        # LONG_OFFLINE; it was a local in run() so restart() couldn't
+        # reset it, meaning long-offline bots stayed in long-sleep
+        # cadence forever after the user clicked "Start all live".
+        self._wake_event = Event()
+        self._offline_time: float = 0
+
         try:
             self.cache_file_list()
         except Exception as e:
@@ -241,20 +252,51 @@ class Bot(Thread):
         with self._state_lock:
             if not self.running:
                 self.logger.verbose("Starting bot...")
-                self._consecutive_errors = 0
-                
-            # If model was offline before restart, reset to force fresh check
-            if self.sc == Status.OFFLINE:
+
+            # 2026-05-09: clear ALL stale-state values that hold the bot
+            # in extended backoff. Previously this only reset OFFLINE →
+            # UNKNOWN, leaving LONG_OFFLINE (sleep_on_long_offline =
+            # 10-20 min), RATELIMIT (exponential), and ERROR (up to 300s
+            # extra) bots stuck in their long-sleep loops even after the
+            # user clicked "Start all live". The result: clicking Start
+            # was effectively a no-op for any bot that had already
+            # backed off, so most of the fleet stayed silent.
+            #
+            # Now any non-PUBLIC/non-PRIVATE state gets cleared to
+            # UNKNOWN so the next iteration of the main loop does a
+            # fresh getStatus() call rather than continuing a backoff
+            # that the user is explicitly trying to abort.
+            stale_states = (Status.OFFLINE, Status.LONG_OFFLINE,
+                            Status.RATELIMIT, Status.ERROR,
+                            Status.UNKNOWN, Status.NOTRUNNING)
+            if self.sc in stale_states:
+                prev = self.sc
                 self.sc = Status.UNKNOWN
-                self.logger.verbose("Previous state was offline, forcing fresh status check")
-                
+                self._consecutive_errors = 0
+                # Reset the offline-time accumulator so a bot that's
+                # been LONG_OFFLINE for hours doesn't immediately
+                # transition back to LONG_OFFLINE on the very next
+                # iteration. Pair with the wake event below.
+                self._offline_time = 0
+                if prev != Status.UNKNOWN:
+                    self.logger.verbose(
+                        f"Resetting stale state {prev.name} → UNKNOWN "
+                        "(forcing fresh status check)"
+                    )
+
             self.running = True
-            
+
             # Reset previous_status to ensure fresh status logging after restart
             self.previous_status = None
-            
+
             # Reset offline timing on restart
             self._last_restart_time = datetime.now().timestamp()
+
+            # Fire the wake signal so any sleep currently in flight
+            # (sleep_on_long_offline = 10+ min, sleep_on_ratelimit
+            # exponential, etc.) breaks out immediately and the main
+            # loop runs a fresh getStatus() right away.
+            self._wake_event.set()
             
             # Ensure the thread is actually alive
             if not self.is_alive():
@@ -364,10 +406,20 @@ class Bot(Thread):
         self.video_files_total_size = _total_size
 
     def _sleep(self, time: Union[int, float]) -> None:
-        """Interruptible sleep that checks for quit/stop signals."""
+        """Interruptible sleep that checks for quit/stop/wake signals.
+
+        2026-05-09: also breaks out when self._wake_event is set, which
+        restart() fires to force a sleeping bot (LONG_OFFLINE or
+        RATELIMIT backoff) to immediately re-check status. Without this,
+        clicking "Start all live" had no effect on bots already in
+        long-sleep loops — they finished their multi-minute sleep
+        before noticing the restart."""
         end_time = datetime.now().timestamp() + time
         while datetime.now().timestamp() < end_time:
             if self.quitting or not self.running:
+                return
+            if self._wake_event.is_set():
+                self._wake_event.clear()
                 return
             remaining = end_time - datetime.now().timestamp()
             sleep(min(1, max(0, remaining)))
@@ -569,8 +621,12 @@ class Bot(Thread):
                                   f"was_active={_was_active})")
             self._sleep(_stagger)
 
-            offline_time = 0
-            
+            # Initialize offline accumulator (instance attr so restart()
+            # can reset it). Keeps backward-compat with anywhere that
+            # used to read self._offline_time before run() started.
+            if not hasattr(self, '_offline_time'):
+                self._offline_time = 0
+
             while self.running and not self.quitting:
                 try:
                     self.recording = False
@@ -587,11 +643,11 @@ class Bot(Thread):
                     if self.sc == Status.ERROR:
                         self._sleep(self.sleep_on_error)
                     if self.sc == Status.OFFLINE:
-                        offline_time += self.sleep_on_offline
-                        if offline_time > self.long_offline_timeout:
+                        self._offline_time += self.sleep_on_offline
+                        if self._offline_time > self.long_offline_timeout:
                             self.sc = Status.LONG_OFFLINE
                     elif self.sc == Status.PUBLIC or self.sc == Status.PRIVATE:
-                        offline_time = 0
+                        self._offline_time = 0
                         if self.sc == Status.PUBLIC:
                             if self.cookie_update_interval > 0 and self.cookieUpdater is not None:
                                 def update_cookie():
@@ -653,7 +709,7 @@ class Bot(Thread):
                     self._sleep(1)
                 elif self.ratelimit:
                     self._sleep(self.sleep_on_ratelimit)
-                elif offline_time > self.long_offline_timeout:
+                elif self._offline_time > self.long_offline_timeout:
                     self._sleep(self.sleep_on_long_offline)
                 elif self.sc == Status.PRIVATE:
                     self._sleep(self.sleep_on_private)
