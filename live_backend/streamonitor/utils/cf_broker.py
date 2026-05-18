@@ -99,21 +99,35 @@ async def mint_cookies_for(
             # which historically handles classic CF challenges better.
             cleanup_browser = None
             if _USE_PATCHRIGHT:
-                import tempfile, os
+                # PER-CALL profile dir so concurrent mint_cookies_for()
+                # invocations don't clash on Chrome's profile lock.
+                # Older approach with a shared dir would silently fail
+                # all-but-one launch when called from parallel tasks.
+                # Deleted at the end of the request.
+                import tempfile, os, shutil, uuid
                 profile_dir = os.path.join(
-                    tempfile.gettempdir(), "harvestr_patchright_cfbroker_profile")
-                os.makedirs(profile_dir, exist_ok=True)
-                context = await p.chromium.launch_persistent_context(
-                    user_data_dir=profile_dir,
-                    channel="chrome",
-                    headless=headless,
-                    user_agent=DEFAULT_UA,
-                    viewport={"width": 1280, "height": 800},
-                    locale="en-US",
-                    java_script_enabled=True,
-                    bypass_csp=True,
-                    args=["--no-first-run", "--no-default-browser-check"],
+                    tempfile.gettempdir(),
+                    f"harvestr_pw_cfbroker_{os.getpid()}_{uuid.uuid4().hex[:8]}",
                 )
+                os.makedirs(profile_dir, exist_ok=True)
+                try:
+                    context = await p.chromium.launch_persistent_context(
+                        user_data_dir=profile_dir,
+                        channel="chrome",
+                        headless=headless,
+                        user_agent=DEFAULT_UA,
+                        viewport={"width": 1280, "height": 800},
+                        locale="en-US",
+                        java_script_enabled=True,
+                        bypass_csp=True,
+                        args=["--no-first-run", "--no-default-browser-check"],
+                    )
+                except Exception as e:
+                    # Patchright launch failed for this call — best-effort
+                    # clean up the profile and surface to outer handler.
+                    try: shutil.rmtree(profile_dir, ignore_errors=True)
+                    except Exception: pass
+                    raise
                 # No separate browser object to close — context owns it.
                 browser = None
             else:
@@ -164,6 +178,16 @@ async def mint_cookies_for(
                 # launch_persistent_context owns its own browser, which
                 # is closed by context.close() above.
                 await browser.close()
+
+        # Clean up the per-call profile dir created above (patchright
+        # path only — the Firefox fallback never sets profile_dir).
+        if _USE_PATCHRIGHT:
+            try:
+                import shutil
+                if 'profile_dir' in locals():
+                    shutil.rmtree(profile_dir, ignore_errors=True)
+            except Exception:
+                pass
 
         # Prepare data
         data = {

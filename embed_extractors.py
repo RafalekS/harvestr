@@ -410,6 +410,11 @@ def extract_via_ytdlp(url: str,
 
 _PW_CTX = None   # module-level browser context, reused across calls
 _PW_PLAYWRIGHT = None
+# Serializes the launch path so concurrent extractor threads don't race
+# two `pw.chromium.launch_persistent_context(...)` calls — patchright
+# locks the profile dir during launch and the loser blows up.
+import threading as _pw_threading_module
+_PW_LAUNCH_LOCK = _pw_threading_module.Lock()
 
 
 # Comprehensive stealth init script — hides automation tells beyond
@@ -483,6 +488,22 @@ def _ensure_playwright(log: Optional[logging.Logger] = None):
         return None, None
     if _PW_CTX is not None:
         return _PW_PLAYWRIGHT, _PW_CTX
+    # Serialize the launch so concurrent threads don't race two
+    # `chromium.launch_persistent_context` calls against the same
+    # profile dir (patchright takes a flock and the loser raises).
+    with _PW_LAUNCH_LOCK:
+        # Re-check under the lock — another thread may have raced
+        # ahead and finished the launch while we were waiting.
+        if _PW_AVAILABLE is False:
+            return None, None
+        if _PW_CTX is not None:
+            return _PW_PLAYWRIGHT, _PW_CTX
+        return _ensure_playwright_locked(log)
+
+
+def _ensure_playwright_locked(log: Optional[logging.Logger] = None):
+    """Inner — must be called with _PW_LAUNCH_LOCK held."""
+    global _PW_CTX, _PW_PLAYWRIGHT, _PW_AVAILABLE
     sync_playwright = None
     use_patchright = False
     # Try patchright first. If it isn't installed yet, attempt the
