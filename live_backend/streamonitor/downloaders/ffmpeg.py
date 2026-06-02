@@ -282,6 +282,15 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
     attempt = 0
     consecutive_stalls = 0
     ever_started = False
+    # Ghost/offline guard: count consecutive ABNORMAL exits that produced no
+    # real data. An offline/ghost model makes ffmpeg exit abnormally on every
+    # attempt; without this it burns all MAX_RESTARTS_ON_STALL attempts (the
+    # "Abnormal exit code" churn) leaving fragmented/0-byte files. Once a real
+    # recording exists the counter resets, so a genuine mid-show ffmpeg exit
+    # keeps its full retry budget.
+    abnormal_no_data = 0
+    _NO_DATA_BYTES = 256 * 1024      # threshold for "produced real data"
+    _MAX_ABNORMAL_NO_DATA = 3        # give up after this many no-data abnormal exits
     
     self.last_ffmpeg_stats = {
         'attempts': 0,
@@ -546,6 +555,26 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
             break
         else:
             log_stall(f"Abnormal exit code {ret}; restarting (attempt {attempt}/{FFSettings.MAX_RESTARTS_ON_STALL})")
+            # Early give-up for ghost/offline streams (single-file output only):
+            # if ffmpeg keeps exiting abnormally without ever writing real data,
+            # stop instead of burning every attempt. A recording that already
+            # has data resets the counter and keeps the full retry budget; even
+            # a false give-up self-heals (the bot's main loop re-detects PUBLIC
+            # and starts a fresh capture).
+            if out_path is not None:
+                cur_size = 0
+                if os.path.exists(out_path):
+                    try:
+                        cur_size = os.path.getsize(out_path)
+                    except OSError:
+                        cur_size = 0
+                if cur_size < _NO_DATA_BYTES:
+                    abnormal_no_data += 1
+                    if abnormal_no_data >= _MAX_ABNORMAL_NO_DATA:
+                        self.logger.warning("No data after repeated abnormal exits - giving up (likely offline/ghost stream)")
+                        break
+                else:
+                    abnormal_no_data = 0
             continue
     
     self.stopDownload = None

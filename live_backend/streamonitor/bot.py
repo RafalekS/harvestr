@@ -351,8 +351,18 @@ class Bot(Thread):
             
             # Ensure the thread is actually alive
             if not self.is_alive():
+                # A never-started thread (ident is None) reaching the restart
+                # path is the NORMAL first start of a freshly-added/loaded bot,
+                # not a failure. Only a thread that actually ran and died is a
+                # real problem. Previously both logged the same WARNING, which
+                # produced 200+ false "Thread was dead" alarms when models were
+                # added/started en masse.
+                never_started = self.ident is None
                 try:
-                    self.logger.warning("Thread was dead during restart, starting new thread")
+                    if never_started:
+                        self.logger.verbose("Starting bot thread")
+                    else:
+                        self.logger.warning("Thread was dead during restart, starting new thread")
                     # Reset thread state
                     self.quitting = False
                     # Start the thread if it's not alive
