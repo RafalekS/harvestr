@@ -10,7 +10,7 @@ import warnings
 import filelock
 from time import sleep
 from datetime import datetime
-from threading import Thread, Event, Lock, RLock
+from threading import Thread, Event, Lock, RLock, BoundedSemaphore
 from typing import Optional, List, Dict, Any, Set, Union, Callable, Type
 
 from streamonitor.enums import Status, Gender, GENDER_DATA, COUNTRIES
@@ -46,6 +46,46 @@ if not VERIFY_SSL:
 # Global locks for thread-safe operations
 _print_lock = Lock()
 _filename_lock = RLock()  # Reentrant lock for nested filename operations
+
+
+# Concurrent-recording cap. DEFAULT IS UNLIMITED (0): the per-recording ffmpeg
+# watchdog (hls.py) now kills dead/ghost streams within ~30s, so the real
+# ceiling is just "how many models are actually live" rather than an unbounded
+# pile of hung ffmpeg. Set HARVESTR_MAX_RECORDINGS=N to re-impose a hard cap of
+# N simultaneous recordings (e.g. on a very RAM-constrained box).
+def _max_recordings_default() -> int:
+    try:
+        return int((os.environ.get("HARVESTR_MAX_RECORDINGS") or "0").strip())
+    except Exception:
+        return 0
+
+
+MAX_CONCURRENT_RECORDINGS = _max_recordings_default()
+# None => unlimited (no semaphore); a positive value caps concurrent recordings.
+_recording_sem = BoundedSemaphore(MAX_CONCURRENT_RECORDINGS) if MAX_CONCURRENT_RECORDINGS > 0 else None
+
+
+def _record_under_cap(bot: 'Bot', video_url: str, file: str) -> bool:
+    """Run bot.getVideo, optionally under the global concurrent-recording cap.
+
+    Unlimited by default (MAX_CONCURRENT_RECORDINGS<=0): just records — the
+    ffmpeg watchdog bounds dead streams. With a positive cap it waits
+    (responsively, so stop()/quit stays honored) for a free slot, holds it for
+    the whole recording, and always releases it; returns False if the bot was
+    stopped/quit before a slot freed up."""
+    if _recording_sem is None:
+        return bool(bot.getVideo(bot, video_url, file))
+    acquired = False
+    while bot.running and not bot.quitting:
+        acquired = _recording_sem.acquire(timeout=2)
+        if acquired:
+            break
+    if not acquired:
+        return False
+    try:
+        return bool(bot.getVideo(bot, video_url, file))
+    finally:
+        _recording_sem.release()
 
 
 # Global set of loaded site classes for upstream compatibility (used by BulkStatusManager)
@@ -566,7 +606,7 @@ class Bot(Thread):
             ok = False
             
             try:
-                ok = bool(self.getVideo(self, video_url, file))
+                ok = _record_under_cap(self, video_url, file)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
@@ -687,7 +727,7 @@ class Bot(Thread):
                             self.recording = True
                             file = self.genOutFilename()
                             try:
-                                ret = self.getVideo(self, video_url, file)
+                                ret = _record_under_cap(self, video_url, file)
                             except Exception as e:
                                 self.logger.exception(e)
                                 ret = False

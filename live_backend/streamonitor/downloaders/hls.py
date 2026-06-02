@@ -164,7 +164,10 @@ class _RollingM3UWriter:
     def _loop(self):
         last_text = None
         consecutive_errors = 0
-        max_errors = 5
+        # Tolerate more transient playlist-fetch blips before giving up. At the
+        # 1.5s poll interval this is ~30s of CDN flakiness, so a brief
+        # doppiocdn hiccup doesn't tear down an otherwise-live recording.
+        max_errors = 20
         
         while not self._stop.is_set():
             try:
@@ -484,28 +487,48 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
         FFMPEG_PATH,
         "-hide_banner", "-loglevel", "info", "-nostdin",
         "-protocol_whitelist", "file,http,https,tcp,tls,crypto,pipe",
-        "-fflags", "+igndts+genpts+discardcorrupt+nobuffer",  # COMBINED: ignore broken DTS, generate PTS, discard corrupt, no buffer
+        # Resilient live capture: ignore broken DTS, generate PTS, discard
+        # corrupt packets. '+nobuffer' was REMOVED — for archival recording we
+        # want ffmpeg to buffer; nobuffer made capture hypersensitive to
+        # doppiocdn keepalive jitter so ffmpeg exited early, which the bot loop
+        # turned into many tiny restart files.
+        "-fflags", "+igndts+genpts+discardcorrupt",
         "-probesize", "4M",
         "-analyzeduration", "10000000",  # 10 seconds
     ]
 
-    # Network options for remote URLs
-    if not local_m3u and str(url_or_path).startswith(("http://", "https://")):
+    is_remote = str(url_or_path).startswith(("http://", "https://"))
+
+    # HTTP *protocol* options only apply when the INPUT itself is an http(s)
+    # URL. Our local rolling .m3u8 (local_m3u=True) is opened via the file
+    # protocol, so passing these there makes ffmpeg abort at input-open with
+    # "Option headers not found". Only add them for a genuinely remote input.
+    if is_remote:
         cmd.extend([
             "-headers", hdr_blob,
-            "-rw_timeout", "5000000",
-            "-timeout", "5000000",
+            "-rw_timeout", "30000000",       # 30s I/O timeout (was 5s)
             "-reconnect", "1",
             "-reconnect_streamed", "1",
             "-reconnect_on_network_error", "1",
             "-reconnect_on_http_error", "4xx,5xx",
             "-reconnect_at_eof", "1",
-            "-reconnect_delay_max", "10",
-            "-live_start_index", "-3",  # Start from last 3 segments
-            "-max_reload", "180",
-            "-seg_max_retry", "180",
-            "-m3u8_hold_counters", "180",
+            "-reconnect_delay_max", "30",    # was 10
         ])
+
+    # HLS *demuxer* options apply whether the playlist is remote or our local
+    # rolling file — the demuxer fetches the (remote doppiocdn) segments
+    # itself. THE KEY FIX: -seg_max_retry makes the demuxer RETRY a segment
+    # whose download fails ("keepalive request failed / I/O error") instead of
+    # giving up (ffmpeg's default is 0 retries), which is what ended StripChat
+    # shows after a few seconds and produced a flood of tiny restart files.
+    # -m3u8_hold_counters lets ffmpeg tolerate a briefly-stalled playlist, then
+    # still finalize cleanly once the model genuinely goes offline.
+    cmd.extend([
+        "-live_start_index", "-3",       # start from last 3 segments
+        "-max_reload", "100",            # keep reloading the playlist
+        "-seg_max_retry", "100",         # retry a failing segment instead of quitting
+        "-m3u8_hold_counters", "60",     # tolerate a stalled playlist, then finalize on true offline
+    ])
 
     # Input
     cmd.extend(["-i", url_or_path])
@@ -556,41 +579,69 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
     )
     proc_ref["p"] = proc
 
-    # Monitor stderr with basic stall detection
-    last_output = time.monotonic()
-    last_size = 0
-    
+    # Watchdog: bound the recording by TIME, not retry count. A model can be
+    # "online" yet yield no real stream (ghost / still connecting / just
+    # ended); with seg_max_retry high, ffmpeg would otherwise retry dead
+    # segments for many minutes, holding a 0-byte file AND a recording slot.
+    # The watchdog aborts ffmpeg when:
+    #   - no bytes at all within NO_DATA_GRACE   -> ghost/offline, give up fast
+    #   - had data, then no growth for STALL_MAX -> stalled, give up
+    # This is what makes a high seg_max_retry safe: real transient hiccups
+    # recover (bytes keep flowing) while dead streams die quickly. (The old
+    # stderr stall-check never fired — it compared now-last_output right after
+    # setting last_output — and `for line in proc.stderr` blocks on a silent
+    # hang, so nothing bounded these.)
+    NO_DATA_GRACE = 30
+    STALL_MAX = 60
+    _wd_stop = threading.Event()
+
+    def _watchdog():
+        start = time.monotonic()
+        last_sz = 0
+        last_growth = start
+        while not _wd_stop.wait(5):
+            try:
+                sz = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+            except Exception:
+                sz = last_sz
+            now = time.monotonic()
+            if sz > last_sz:
+                last_sz = sz
+                last_growth = now
+            if last_sz == 0 and (now - start) > NO_DATA_GRACE:
+                self.logger.warning(f"No data within {NO_DATA_GRACE}s - aborting (likely offline/ghost stream)")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+            if last_sz > 0 and (now - last_growth) > STALL_MAX:
+                self.logger.warning(f"Output stalled {STALL_MAX}s - aborting")
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return
+
+    _wd_thread = threading.Thread(target=_watchdog, daemon=True)
+    _wd_thread.start()
+
+    # Drain stderr (for logging only; the watchdog above owns stall/abort).
     try:
         for line in proc.stderr:
             line = (line or "").rstrip("\r\n")
             if not line:
                 continue
-            
             if DEBUG:
                 self.logger.debug(f"[ffmpeg] {line}")
-            
-            # Check for critical errors
             if "invalid" in line.lower() or "error" in line.lower():
                 if "No such" in line or "failed" in line:
                     self.logger.error(f"FFmpeg error: {line}")
-            
-            last_output = time.monotonic()
-            
-            # Check output growth every 30 seconds
-            now = time.monotonic()
-            if now - last_output > 30:
-                try:
-                    if os.path.exists(out_path):
-                        size = os.path.getsize(out_path)
-                        if size == last_size:
-                            self.logger.warning("Output not growing, possible stall")
-                        last_size = size
-                except Exception:
-                    pass
     except Exception:
         pass
 
     rc = proc.wait()
+    _wd_stop.set()
     proc_ref["p"] = None
     
     try:

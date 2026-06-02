@@ -16,6 +16,16 @@ except ImportError:
     COLORAMA_AVAILABLE = False
 
 
+# Console output must tolerate non-ASCII (emoji, em-dash, …). On a Windows
+# cp1252 console such characters would otherwise raise UnicodeEncodeError
+# inside the StreamHandler mid-log. The file handler is already utf-8; this
+# makes stdout escape un-encodable chars instead of crashing the handler.
+try:
+    sys.stdout.reconfigure(errors="backslashreplace")
+except Exception:
+    pass
+
+
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that gets colors from the bot instance."""
     

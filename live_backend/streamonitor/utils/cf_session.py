@@ -22,7 +22,7 @@ from curl_cffi.requests.exceptions import (
     HTTPError as CurlHTTPError,
 )
 
-from .cf_broker import load_or_mint, mint_cookies_for, write
+from .cf_broker import load_or_mint, mint_cookies_for, mint_cookies_dedup, write
 from .CloudflareDetection import looks_like_cf_html
 
 
@@ -453,7 +453,7 @@ class CFSessionManager:
                                 f"{self.bot_id} [{domain}/{bucket}] "
                                 f"Cloudflare challenge detected, minting cookies..."
                             )
-                        data = await mint_cookies_for(domain, hs.visit_urls)
+                        data = await mint_cookies_dedup(domain, hs.visit_urls)
                         write(domain, data)
                         hs.apply_cookie_data(data)
                         hs.last_mint_ts = now2

@@ -10,8 +10,9 @@ import json
 import logging
 import sys
 import time
+import asyncio
 from pathlib import Path
-from typing import Iterable, Dict
+from typing import Iterable, Dict, Optional
 
 # Lazy auto-installer for patchright. The helper sits next to the
 # universal/ project root; reach it via a small sys.path nudge so this
@@ -210,6 +211,64 @@ async def mint_cookies_for(
         }
 
 
+# ── Process-global mint throttle ──────────────────────────────────────
+# Each browser launch (Chrome via patchright / Firefox fallback) costs
+# 150-400 MB. Every Bot has its OWN CFSessionManager, so without a global
+# throttle, N bots that all need cookies for the SAME domain each launch
+# their own browser — 607 Chaturbate bots minting chaturbate.com produced
+# up to 25 concurrent Chrome instances per second and exhausted RAM.
+#
+# These asyncio primitives are loop-bound; every bot shares ONE event loop
+# (see cf_session._ensure_loop), so they resolve to a single shared
+# instance, created lazily on first use exactly like _GLOBAL_HTTP_SEM.
+_MINT_MAX_CONCURRENT = 2          # at most this many browsers alive at once
+_MINT_DEDUP_WINDOW = 5 * 60       # reuse a sibling bot's mint if newer than this
+_MINT_BROWSER_SEM: Optional[asyncio.Semaphore] = None
+_MINT_DOMAIN_LOCKS: Dict[str, asyncio.Lock] = {}
+_MINT_LAST_TS: Dict[str, float] = {}
+
+
+def _mint_browser_sem() -> asyncio.Semaphore:
+    global _MINT_BROWSER_SEM
+    if _MINT_BROWSER_SEM is None:
+        _MINT_BROWSER_SEM = asyncio.Semaphore(_MINT_MAX_CONCURRENT)
+    return _MINT_BROWSER_SEM
+
+
+def _mint_domain_lock(domain: str) -> asyncio.Lock:
+    lock = _MINT_DOMAIN_LOCKS.get(domain)
+    if lock is None:
+        lock = asyncio.Lock()
+        _MINT_DOMAIN_LOCKS[domain] = lock
+    return lock
+
+
+async def mint_cookies_dedup(domain: str, visit_urls: Iterable[str], **kwargs) -> Dict:
+    """Globally-deduplicated, concurrency-capped cookie mint.
+
+    Collapses the N bots that all need cookies for the same domain into a
+    single browser launch: the first bot to win the per-domain lock mints,
+    every other bot that was waiting reloads the just-written cookie from
+    disk instead of launching its own browser. A small global semaphore
+    caps how many domains can be minting browsers at the same instant.
+    """
+    visit_urls = list(visit_urls)
+    lock = _mint_domain_lock(domain)
+    async with lock:
+        # A sibling bot may have minted for this domain while we waited on
+        # the lock — if so, reuse its fresh cookie from disk (no browser).
+        last = _MINT_LAST_TS.get(domain, 0.0)
+        if time.time() - last < _MINT_DEDUP_WINDOW:
+            disk = read(domain)
+            if disk.get("cookies"):
+                return disk
+        # We're the elected minter for this domain. Cap total live browsers.
+        async with _mint_browser_sem():
+            data = await mint_cookies_for(domain, visit_urls, **kwargs)
+        _MINT_LAST_TS[domain] = time.time()
+        return data
+
+
 async def load_or_mint(
     domain: str,
     visit_urls: Iterable[str],
@@ -242,8 +301,8 @@ async def load_or_mint(
             # Fall through to minting - stale cookies will be refreshed
             pass
     
-    # Mint fresh cookies
-    return await mint_cookies_for(domain, visit_urls)
+    # Mint fresh cookies (globally deduped + browser-capped)
+    return await mint_cookies_dedup(domain, visit_urls)
 
 
 def write(domain: str, data: dict):
