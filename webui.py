@@ -46,7 +46,7 @@ LOG_PATH = DOWNLOADS_DIR / "universal.log"
 
 app = Flask(__name__)
 
-# ── Live recording manager (lazy — imports StreaMonitor if available) ────────
+# ── Live recording manager (lazy – imports StreaMonitor if available) ────────
 try:
     from live_recording import LiveManager as _LiveManager, available as _live_available
     _live = _LiveManager(downloads_dir=DOWNLOADS_DIR)
@@ -158,7 +158,7 @@ def _archive_is_running() -> bool:
 
 def _kill_archive_subprocess(timeout: float = 10.0) -> bool:
     """Kill the tracked archive subprocess and clear stale progress state.
-    Idempotent — safe to call when no archive is running. Returns True if
+    Idempotent – safe to call when no archive is running. Returns True if
     something was actually killed."""
     global _runner_thread
     killed = False
@@ -174,7 +174,7 @@ def _kill_archive_subprocess(timeout: float = 10.0) -> bool:
             try:
                 proc.wait(timeout=timeout)
             except subprocess.TimeoutExpired:
-                # Subprocess didn't die — try kill() as last resort
+                # Subprocess didn't die – try kill() as last resort
                 try: proc.kill()
                 except Exception: pass
             killed = True
@@ -276,7 +276,7 @@ def load_sites() -> list[str]:
     return [s["name"] for s in load_sites_detailed()]
 
 
-# Sites that benefit from or require cookie auth — surfaced in the UI's
+# Sites that benefit from or require cookie auth – surfaced in the UI's
 # auth panel with inline setup instructions.
 AUTH_SITES: dict[str, dict] = {
     "recume": {
@@ -325,7 +325,7 @@ AUTH_SITES: dict[str, dict] = {
             "Tango.me streams require a master.m3u8?token=... URL extracted "
             "manually from the browser's Network tab. The bot expects this "
             "URL in the room_id field (NOT the username). Use streams from "
-            "the 'Following' tab — those have static tokens that stay valid "
+            "the 'Following' tab – those have static tokens that stay valid "
             "for the duration of the live show. Streams from 'For You' or "
             "'Explore' have token-refresh and won't keep recording. "
             "See yt-dlp/yt-dlp#11433 for context."
@@ -465,7 +465,7 @@ def cookies_diagnostics() -> dict:
         found = _match(domain_map.get(key, key))
         missing = [c for c in info["cookies"] if c.lower() not in {n.lower() for n in found}]
         status = "ok" if not missing else ("partial" if found else "none")
-        # Sites authenticating via username/password (camsmut) — treat as OK
+        # Sites authenticating via username/password (camsmut) – treat as OK
         # when credentials are present in config even if no cookies are loaded.
         if info.get("uses_credentials"):
             if key == "camsmut" and cfg.get("camsmut_username") and cfg.get("camsmut_password"):
@@ -493,7 +493,7 @@ INDEX_HTML = r"""
 <head>
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-<title>Harvestr — video downloader</title>
+<title>Harvestr – video downloader</title>
 <link rel="icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0' stop-color='%23a0d7ff'/><stop offset='1' stop-color='%232a6cb3'/></linearGradient></defs><circle cx='32' cy='32' r='28' fill='%23181b22' stroke='url(%23g)' stroke-width='2'/><path d='M32 14 L32 40 M22 32 L32 42 L42 32' stroke='url(%23g)' stroke-width='3' fill='none' stroke-linecap='round' stroke-linejoin='round'/><path d='M18 48 L46 48' stroke='url(%23g)' stroke-width='3' stroke-linecap='round'/></svg>"/>
 <style>
   :root {
@@ -806,7 +806,7 @@ INDEX_HTML = r"""
     text-decoration-color: var(--accent);
   }
 
-  /* Tooltips — use max z-index + escape via filter so cards can't clip */
+  /* Tooltips – use max z-index + escape via filter so cards can't clip */
   [data-tip] { position: relative; }
   [data-tip]:hover::after,
   [data-tip]:focus-visible::after {
@@ -872,7 +872,7 @@ INDEX_HTML = r"""
     animation-name: tip-in-down;
   }
 
-  /* Cards need visible overflow so tooltips can escape — but inner panels
+  /* Cards need visible overflow so tooltips can escape – but inner panels
      with internal scroll areas keep their overflow for real content. */
   .card { overflow: visible; }
 
@@ -902,7 +902,7 @@ INDEX_HTML = r"""
   .auth-site details summary { cursor: pointer; color: var(--accent);
                                 font-size: 12px; padding: 3px 0; }
 
-  /* Toasts — stacking container */
+  /* Toasts – stacking container */
   #toast-stack {
     position: fixed; top: 74px; right: 24px; z-index: 200;
     display: flex; flex-direction: column; gap: 8px; max-width: min(420px, 90vw);
@@ -1210,7 +1210,7 @@ INDEX_HTML = r"""
   .live-card .actions button.icon-only { flex: 0 0 34px; padding: 6px; }
   .live-card .actions button svg { width: 12px; height: 12px; }
 
-  /* Thumbnail header — shown when the site returned an avatar/preview */
+  /* Thumbnail header – shown when the site returned an avatar/preview */
   .live-card .hero {
     margin: -14px -16px 10px -16px;
     height: 90px;
@@ -1656,7 +1656,7 @@ INDEX_HTML = r"""
         </div>
         <div class="danger-row" style="margin-top: 8px;">
           <div class="muted" style="flex:1; font-size:12px;">
-            Reset <b>ALL</b> performers' history — next run will re-probe every site.
+            Reset <b>ALL</b> performers' history – next run will re-probe every site.
           </div>
           <button class="danger" onclick="resetHistoryAll()">
             <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
@@ -1825,7 +1825,7 @@ INDEX_HTML = r"""
     </h2>
     <p class="muted" style="font-size:13px;">
       The vendored Live backend (<code>live_backend/streamonitor/</code>) failed
-      to import. This is unusual — run
+      to import. This is unusual – run
       <code>python -c "from live_recording import available; print(available)"</code>
       to see the error, or check <code>downloads/universal.log</code>.
     </p>
@@ -1858,7 +1858,7 @@ INDEX_HTML = r"""
                aria-label="Model username to add"
                onkeydown="if(event.key==='Enter'){liveAdd()}"/>
         <select id="live-new-site" aria-label="Cam site">
-          <option value="">— Site —</option>
+          <option value="">– Site –</option>
         </select>
         <button class="primary" id="live-add-btn" onclick="liveAdd()"
                 data-tip="Auto-resolves the room ID from username">
@@ -1914,7 +1914,7 @@ INDEX_HTML = r"""
         </div>
         <div class="repair-progress-bar"><div class="fill" id="repair-bar-fill"></div></div>
         <div class="repair-banner-body">
-          <div class="repair-current" id="repair-current">—</div>
+          <div class="repair-current" id="repair-current">–</div>
           <div class="repair-counts" id="repair-counts"></div>
         </div>
       </div>
@@ -2116,13 +2116,13 @@ function escapeHtml(s) {
   return (s||'').replace(/[&<>"']/g, c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 }
 function bytesHuman(n) {
-  if (!n && n !== 0) return '—';
+  if (!n && n !== 0) return '–';
   const u = ['B','KB','MB','GB','TB']; let i=0; let x=n;
   while (x >= 1024 && i < u.length-1) { x /= 1024; i++; }
   return (i === 0 ? x : x.toFixed(x < 10 ? 2 : 1)) + ' ' + u[i];
 }
 function secsHuman(n) {
-  if (!n || n < 0) return '—';
+  if (!n || n < 0) return '–';
   if (n < 60) return n + 's';
   if (n < 3600) return Math.floor(n/60) + 'm ' + (n%60).toString().padStart(2,'0') + 's';
   const h = Math.floor(n/3600); const m = Math.floor((n%3600)/60);
@@ -2135,7 +2135,7 @@ async function api(path, opts={}) {
 }
 
 // 2026-05-09: defensive POST helper for handlers that just need
-// "did the server accept this" — not the parsed JSON body. Some browser
+// "did the server accept this" – not the parsed JSON body. Some browser
 // extensions (cookie-extractor, password managers) inject content
 // scripts that wrap fetch and break r.json() mid-promise, throwing
 // "Cannot read properties of undefined (reading 'useCache')". With the
@@ -2282,7 +2282,7 @@ async function refreshProgress() {
           .map(h => {
             const url = h.url || '';
             const tip = url
-              ? `Open ${escapeHtml(h.site)} page for '${escapeHtml(sess.performer || '')}' in new tab — verify it's the right ${h.count} videos`
+              ? `Open ${escapeHtml(h.site)} page for '${escapeHtml(sess.performer || '')}' in new tab – verify it's the right ${h.count} videos`
               : '';
             const inner = `${escapeHtml(h.site)} · ${h.count}`;
             if (url) {
@@ -2307,8 +2307,8 @@ async function refreshProgress() {
         const pct = Math.min(100, Math.max(0, a.percent || 0));
         const done = bytesHuman(a.bytes_done || 0);
         const total = a.bytes_total ? bytesHuman(a.bytes_total) : '?';
-        const speed = a.speed_bps ? bytesHuman(a.speed_bps) + '/s' : '—';
-        const eta = a.eta_seconds ? secsHuman(a.eta_seconds) : '—';
+        const speed = a.speed_bps ? bytesHuman(a.speed_bps) + '/s' : '–';
+        const eta = a.eta_seconds ? secsHuman(a.eta_seconds) : '–';
         const slot = (a.slot !== undefined && a.slot !== null) ? a.slot : -1;
         const cancelling = (p.cancelled_slots || []).includes(slot);
         const btnTitle = cancelling ? 'Cancelling…' : 'Skip this download';
@@ -2319,7 +2319,7 @@ async function refreshProgress() {
         const titleEl = vurl
           ? `<a class="title clickable" href="${escapeHtml(vurl)}" target="_blank"
                 rel="noopener noreferrer" title="${titleFull}"
-                data-tip="Open on ${escapeHtml(a.site || '')} in new tab — verify this is ${escapeHtml(sess.performer || 'the right performer')}">${titleText}</a>`
+                data-tip="Open on ${escapeHtml(a.site || '')} in new tab – verify this is ${escapeHtml(sess.performer || 'the right performer')}">${titleText}</a>`
           : `<span class="title" title="${titleFull}">${titleText}</span>`;
         return `<div class="dl-active${cancelling ? ' cancelling' : ''}" data-slot="${slot}">
           <div class="top">
@@ -2340,9 +2340,9 @@ async function refreshProgress() {
         </div>`;
       }).join('');
     } else if (phase === 'downloading') {
-      activeHtml = '<div class="dl-empty">Queue ready — waiting for next slot…</div>';
+      activeHtml = '<div class="dl-empty">Queue ready – waiting for next slot…</div>';
     } else if (!phase || phase === 'idle') {
-      activeHtml = '<div class="dl-empty">Session starting — initializing scrapers…</div>';
+      activeHtml = '<div class="dl-empty">Session starting – initializing scrapers…</div>';
     }
 
     listEl.innerHTML = phaseHtml + hitsHtml + activeHtml;
@@ -2363,7 +2363,7 @@ async function cancelSlot(slot, ev) {
   );
   if (!ok) return;
 
-  // Optimistic UI — grey out the row immediately
+  // Optimistic UI – grey out the row immediately
   if (row) {
     row.classList.add('cancelling');
     const btn = row.querySelector('.dl-cancel');
@@ -2467,7 +2467,7 @@ async function saveLiveSettings() {
   // managers) inject content scripts that wrap fetch and throw
   // `useCache` / "receiving end does not exist" errors mid-promise.
   // The api() helper's `r.json()` call gets caught by that and the
-  // success branch never runs — so the modal stays open and no toast
+  // success branch never runs – so the modal stays open and no toast
   // appears even though the POST itself succeeded server-side.
   // Detect success via HTTP status alone, then run each UI update in
   // its own try/catch so an extension-induced sync throw can't take
@@ -2501,7 +2501,7 @@ async function resetHistoryOne() {
   if (!name) { toast('Pick a performer first', 'error'); return; }
   const ok = await confirmDialog(
     `Clear download + failure history for <b>${escapeHtml(name)}</b>?<br><br>` +
-    `Files on disk stay, but Harvestr will treat every video as "never seen" — ` +
+    `Files on disk stay, but Harvestr will treat every video as "never seen" – ` +
     `next run will re-probe every site and re-download anything new. ` +
     `Useful if you deleted files from disk or you're testing scraper changes.`,
     {title: 'Reset history for one performer', tone: 'warn',
@@ -2780,7 +2780,7 @@ function renderAuth() {
   <li>Come back here → <b>Settings</b> (above) → fill <b>CamSmut user</b> and <b>CamSmut password</b>.</li>
   <li>Click <b>Save settings</b>. Harvestr will auto-login on the next scrape.</li>
 </ol>
-<p class="muted">No cookies.txt required — credentials are stored in <code>config.json</code>. Delete them anytime by clearing those fields and saving.</p>`},
+<p class="muted">No cookies.txt required – credentials are stored in <code>config.json</code>. Delete them anytime by clearing those fields and saving.</p>`},
   };
 
   // Build cards in our preferred order
@@ -2820,7 +2820,7 @@ async function loadHistory() {
   _populateHistSites();
   renderHistory();
   renderFailed();
-  // Performer counts depend on history — re-render so each row shows
+  // Performer counts depend on history – re-render so each row shows
   // its real video count instead of 0.
   renderPerformers();
 }
@@ -2871,7 +2871,7 @@ function renderHistory() {
 
   if (!rows.length) {
     tbody.innerHTML = `<tr><td colspan="6" class="muted" style="text-align:center;padding:20px;">
-      No downloads yet — start one above.</td></tr>`;
+      No downloads yet – start one above.</td></tr>`;
     return;
   }
   tbody.innerHTML = rows.slice(0, 500).map(r => `
@@ -3065,7 +3065,7 @@ async function liveLoadSites() {
       const opt = sel.options[sel.selectedIndex];
       const needsRoomId = opt && opt.dataset.needsRoomId === '1';
       document.getElementById('live-site-hint').textContent = needsRoomId
-        ? "We'll auto-resolve the room ID from the username — no extra input needed."
+        ? "We'll auto-resolve the room ID from the username – no extra input needed."
         : '';
     };
   } catch(e) {
@@ -3074,7 +3074,7 @@ async function liveLoadSites() {
 }
 
 async function liveRefresh() {
-  // 2026-05-10: bypass api() helper which calls r.json() — browser
+  // 2026-05-10: bypass api() helper which calls r.json() – browser
   // extensions (cookie-extractors, password managers) wrap fetch and
   // sometimes throw mid-parse on the larger Live response (660 KB).
   // When that happens the catch returns early, so renderLiveModels()
@@ -3088,14 +3088,14 @@ async function liveRefresh() {
     try {
       data = await r.json();
     } catch (parseErr) {
-      // Extension-induced parse failure — try the raw text path
+      // Extension-induced parse failure – try the raw text path
       try {
         const txt = await r.text();
         data = JSON.parse(txt);
       } catch (rawErr) {
         console.error('liveRefresh: both r.json() and JSON.parse(r.text()) failed',
                       parseErr, rawErr);
-        // Don't return — keep the previous _liveSnapshot so the UI
+        // Don't return – keep the previous _liveSnapshot so the UI
         // doesn't blank out on a single transient extension hiccup.
         renderLiveModels();
         return;
@@ -3184,7 +3184,7 @@ function renderLiveModels() {
     if (m.status === 'PUBLIC') cls.push('live-now');
     if (m.status === 'ERROR' || m.status === 'NOTEXIST' || m.status === 'DELETED') cls.push('error-state');
     if (!m.running && (m.status === 'OFFLINE' || m.status === 'NOTRUNNING')) cls.push('paused-state');
-    const size = m.size_bytes ? bytesHuman(m.size_bytes) : '—';
+    const size = m.size_bytes ? bytesHuman(m.size_bytes) : '–';
 
     // Hero thumbnail
     const hero = m.thumb_url || m.avatar_url;
@@ -3214,11 +3214,16 @@ function renderLiveModels() {
       : '';
 
     // Frequency / history
-    const lastOn = m.last_online_ts ? relTime(m.last_online_ts) : '—';
-    const nextPred = m.next_predicted_ts ? relTime(m.next_predicted_ts) : '—';
-    const hoursW = m.online_hours_7d ? m.online_hours_7d.toFixed(1) + 'h' : '—';
-    const sessW = m.online_sessions_7d || 0;
-    const avgMin = m.avg_session_minutes ? m.avg_session_minutes + 'm' : '—';
+    const lastOn = m.last_online_ts ? relTime(m.last_online_ts) : '–';
+    const nextPred = m.next_predicted_ts ? relTime(m.next_predicted_ts) : '–';
+    // Coerce stats to numbers before arithmetic – the backend can serialize
+    // these as strings for some models, and `"5.2".toFixed` throws, which was
+    // the Chaturbate-card "render error" root cause.
+    const _hrs = Number(m.online_hours_7d) || 0;
+    const hoursW = _hrs ? _hrs.toFixed(1) + 'h' : '–';
+    const sessW = Number(m.online_sessions_7d) || 0;
+    const _avg = Number(m.avg_session_minutes) || 0;
+    const avgMin = _avg ? Math.round(_avg) + 'm' : '–';
     const lastOnClass = m.last_online_ts ? 'good' : '';
     const freqGrid = (m.last_online_ts || m.next_predicted_ts || sessW > 0)
       ? `<div class="freq-grid">
@@ -3264,13 +3269,13 @@ function renderLiveModels() {
           Start
         </button>`;
     }
-    // Folder — opens live_dir/<user> [SITE]/ in explorer
+    // Folder – opens live_dir/<user> [SITE]/ in explorer
     actions += `
       <button class="ghost icon-only" onclick="liveOpenFolder('${u}','${escapeHtml(m.site_slug || m.site)}')"
               data-tip="Open recordings folder on disk" aria-label="Open folder">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>
       </button>`;
-    // Repair — checks every recorded file in this model's folder, fixes
+    // Repair – checks every recorded file in this model's folder, fixes
     // what it can (remux or re-encode) and flags the hopeless ones.
     actions += `
       <button class="ghost icon-only" onclick="liveRepair('${u}','${s}')"
@@ -3360,10 +3365,10 @@ function numHuman(n) {
 }
 
 function relTime(iso) {
-  if (!iso) return '—';
+  if (!iso) return '–';
   const now = Date.now();
   const t = new Date(iso).getTime();
-  if (isNaN(t)) return '—';
+  if (isNaN(t)) return '–';
   const diffSec = Math.floor((t - now) / 1000);
   const future = diffSec > 0;
   const d = Math.abs(diffSec);
@@ -3428,7 +3433,7 @@ async function liveStop(username, site) {
 async function livePause(username, site) {
   // Soft-stop: keep the model in the tracking list but stop polling.
   // Resume via the Start button. Backend just calls stop() without
-  // removing — same endpoint, different UX framing.
+  // removing – same endpoint, different UX framing.
   const res = await apiPostOk('/api/live/pause', {username, site});
   if (res.ok) {
     try { toast(`Paused ${username}`); } catch(_){}
@@ -3444,7 +3449,7 @@ async function liveOpenFolder(username, siteSlug) {
     await api('/api/open-folder', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({path: folder})});
     toast(`Opened folder for ${username}`);
-  } catch(e) { toast('Folder not found — no recordings yet?', 'error'); }
+  } catch(e) { toast('Folder not found – no recordings yet?', 'error'); }
 }
 
 // ── Live repair: 3-tier ffmpeg pipeline (check → remux → re-encode → delete)
@@ -3510,7 +3515,7 @@ async function _pollRepair() {
       finished: 'done', error: 'error',
     }[s.stage] || s.stage;
 
-    title.textContent = `${scopeLabel} — ${stageLabel}`;
+    title.textContent = `${scopeLabel} – ${stageLabel}`;
     const p = s.total > 0 ? Math.min(100, Math.round(100 * s.current / s.total)) : 0;
     pct.textContent = s.total ? `${s.current}/${s.total} (${p}%)` : '';
     elapsed.textContent = _fmtElapsed(s.started_at, s.finished_at);
@@ -3529,7 +3534,7 @@ async function _pollRepair() {
     } else if (s.stage === 'error') {
       banner.classList.add('error');
       if (_repairPollTimer) { clearInterval(_repairPollTimer); _repairPollTimer = null; }
-      toast('Repair failed — see log', 'error');
+      toast('Repair failed – see log', 'error');
     }
   } catch (e) {
     console.error('repair poll', e);
@@ -3545,7 +3550,7 @@ async function liveRepair(username, site) {
   const ok = await confirmDialog(
     `Check every recording for <b>${escapeHtml(username)}</b> on <b>${escapeHtml(site)}</b>?<br><br>` +
     `<b>Tier 1</b> (ffprobe): validate playability.<br>` +
-    `<b>Tier 2</b> (ffmpeg remux): fix missing moov atoms — no quality loss.<br>` +
+    `<b>Tier 2</b> (ffmpeg remux): fix missing moov atoms – no quality loss.<br>` +
     `<b>Tier 3</b> (ffmpeg re-encode): last-resort full re-encode.<br>` +
     `<br>Progress appears at the top of the Live tab. ` +
     `Files the recorder is currently writing to are skipped.`,
@@ -3565,14 +3570,14 @@ async function liveRepairAll() {
   const deleteUnfixable = await confirmDialog(
     `Sweep every model's recording folder and repair every video.<br><br>` +
     `<b>Delete unfixable files?</b><br>` +
-    `<b>YES</b> — files that even a full re-encode can't save are deleted (truncated header stubs etc).<br>` +
-    `<b>NO</b> — broken files stay on disk, flagged in the counts only.<br><br>` +
+    `<b>YES</b> – files that even a full re-encode can't save are deleted (truncated header stubs etc).<br>` +
+    `<b>NO</b> – broken files stay on disk, flagged in the counts only.<br><br>` +
     `Files currently being recorded are skipped either way.`,
     {title: 'Repair all recordings', tone: 'warn',
-     confirmLabel: 'YES — delete unfixable', cancelLabel: 'Keep broken files'});
+     confirmLabel: 'YES – delete unfixable', cancelLabel: 'Keep broken files'});
   // User chose: confirmLabel → true (delete); cancelLabel → false (keep);
   // backdrop/escape → false (treated as "keep", not a cancel of the whole
-  // operation — adjust below if you'd rather treat escape as cancel).
+  // operation – adjust below if you'd rather treat escape as cancel).
   try {
     const r = await api('/api/live/repair_all', {
       method:'POST', headers:{'Content-Type':'application/json'},
@@ -3750,11 +3755,11 @@ async function diskPruneToFree() {
       headers:{'Content-Type':'application/json'},
       body: JSON.stringify({target_free_gb: gb})});
     if (preview.nothing_to_do) {
-      toast(`Already have ${preview.already_free_gb.toFixed(1)} GB free — no action needed`);
+      toast(`Already have ${preview.already_free_gb.toFixed(1)} GB free – no action needed`);
       return;
     }
     const shortfall = preview.still_needed_bytes > 0
-      ? `<br><br><span style="color: var(--warn)">Not enough old content — would still be ${bytesHuman(preview.still_needed_bytes)} short of target.</span>` : '';
+      ? `<br><br><span style="color: var(--warn)">Not enough old content – would still be ${bytesHuman(preview.still_needed_bytes)} short of target.</span>` : '';
     if (!await confirmDialog(
           `Would delete <b>${preview.would_delete}</b> files to free <b>${bytesHuman(preview.would_free_bytes)}</b>.${shortfall}`,
           {title: 'Confirm free-up', tone: 'danger',
@@ -3860,7 +3865,7 @@ function openBulkAdd() {
   document.getElementById('bulkadd-title').textContent = 'Bulk add performers';
   document.getElementById('bulkadd-sub').innerHTML =
     'One username per line.<br>' +
-    'Or upload a <code>config.json</code> export — we merge <code>performers</code> + enabled sites.';
+    'Or upload a <code>config.json</code> export – we merge <code>performers</code> + enabled sites.';
   document.getElementById('bulkadd-text').placeholder =
     'alice_example\nbob_example\n# lines starting with # are comments';
   document.getElementById('bulkadd-modal').classList.add('show');
@@ -3871,7 +3876,7 @@ function openLiveBulkAdd() {
   _bulkaddMode = 'live';
   document.getElementById('bulkadd-title').textContent = 'Bulk add live models';
   document.getElementById('bulkadd-sub').innerHTML =
-    'One per line: <code>username Site</code> — room IDs auto-resolved.<br>' +
+    'One per line: <code>username Site</code> – room IDs auto-resolved.<br>' +
     'Or upload a JSON array like <code>[{"username":"alice","site":"Chaturbate"}]</code>.';
   document.getElementById('bulkadd-text').placeholder =
     'alice Chaturbate\nbob StripChat\n# username site (one per line)';
@@ -3912,7 +3917,7 @@ function bulkaddLoadFile(e) {
         toast(`Loaded ${f.name}`, 'success');
       }
     } catch (err) {
-      // Not JSON — treat as plaintext
+      // Not JSON – treat as plaintext
       document.getElementById('bulkadd-text').value = text;
       toast(`Loaded ${f.name} (plaintext)`);
     }
@@ -4030,7 +4035,7 @@ document.addEventListener('keydown', (e) => {
   if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
     e.preventDefault(); openPalette();
   } else if (e.key === 'Escape') {
-    // Close whichever modal is open (dialog first — it returns a Promise)
+    // Close whichever modal is open (dialog first – it returns a Promise)
     const dlg = document.getElementById('dialog-modal');
     if (dlg && dlg.classList.contains('show')) { dialogCancel(); return; }
     ['palette-modal','bulkadd-modal','preview-modal'].forEach(id => {
@@ -4059,7 +4064,7 @@ document.addEventListener('keydown', (e) => {
   setInterval(loadHistory, 15000);
   setInterval(loadAuth, 30000);
   setInterval(loadDisk, 20000);        // disk snapshot every 20s
-  // Live polling — only every 3s and only when Live tab visible
+  // Live polling – only every 3s and only when Live tab visible
   setInterval(() => { if (_currentPage === 'live') liveRefresh(); }, 3000);
   // Always pull ONCE so the "Live" tab badge can update even from Archive tab
   setInterval(async () => {
@@ -4139,7 +4144,7 @@ threading.Thread(target=_monitor_subprocess, daemon=True).start()
 @app.route("/")
 def index():
     """Serve the SPA. Cache-Control headers force the browser to revalidate
-    on every load — the inline JS is large and changes frequently, and a
+    on every load – the inline JS is large and changes frequently, and a
     stale cache from an earlier session causes silent rendering failures
     (UI loads but stays blank because the JS expects a different DOM
     shape or API response than what's now served)."""
@@ -4156,7 +4161,7 @@ def api_status():
 
     _state["running"] only tracks archive jobs started BY this webui
     process. If the user started the downloader directly from the CLI
-    (or before we restarted) we wouldn't see it — so we also check the
+    (or before we restarted) we wouldn't see it – so we also check the
     shared _progress.json (written by any downloader process) and the
     live manager for recording models. Any of these means "not idle"."""
     with _state_lock:
@@ -4555,7 +4560,7 @@ def api_run():
     """Start the archive download subprocess.
 
     Mutual exclusion: stops every running Live bot before launching the
-    archive subprocess. The two modes can't be active at once — a running
+    archive subprocess. The two modes can't be active at once – a running
     archive saturates the same network/CPU/disk pipes Live needs to keep
     its open RTMP/HLS streams from dropping segments."""
     global _runner_thread
@@ -4601,15 +4606,15 @@ def api_run():
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
     """Stop the archive subprocess. Always clears _progress.json's running
-    flag so the UI updates immediately — otherwise the front-end keeps
+    flag so the UI updates immediately – otherwise the front-end keeps
     showing 'probing' even after the process is dead, and Start stays
     disabled. Also handles the case where the subprocess was started from
     the CLI (not by us) by reading the PID out of _progress.json."""
-    # _kill_archive_subprocess is idempotent — it kills our tracked process
+    # _kill_archive_subprocess is idempotent – it kills our tracked process
     # AND any external PID found in _progress.json, then clears the flag.
     killed = _kill_archive_subprocess(timeout=10.0)
     if not killed and not _archive_is_running():
-        # Nothing was running and nothing was killed — but also nothing's
+        # Nothing was running and nothing was killed – but also nothing's
         # stuck. Still return OK so the UI can re-enable Start cleanly.
         return jsonify({"ok": True, "was_running": False})
     return jsonify({"ok": True, "was_running": True, "killed": killed})
@@ -4618,7 +4623,7 @@ def api_stop():
 @app.route("/api/disk")
 def api_disk():
     """Snapshot: per-performer bytes, per-site totals, free space on drive.
-    Cached for 3 s on the backend — safe to poll aggressively."""
+    Cached for 3 s on the backend – safe to poll aggressively."""
     if not _disk:
         return jsonify({"error": "disk manager unavailable"}), 500
     force = request.args.get("force") == "1"
@@ -4627,7 +4632,7 @@ def api_disk():
 
 @app.route("/api/disk/wipe", methods=["POST"])
 def api_disk_wipe():
-    """Delete every video for one performer. Hard op — requires confirm."""
+    """Delete every video for one performer. Hard op – requires confirm."""
     if not _disk:
         return jsonify({"error": "disk manager unavailable"}), 500
     body = request.get_json(force=True) or {}
@@ -4801,7 +4806,7 @@ def api_live_stop():
 def api_live_pause():
     """Pause is a soft-stop: model stays in the list, thread stops, the UI
     shows a 'PAUSED' chip and a Start button to resume. Internally the
-    same as stop_model() — the UI just presents it differently."""
+    same as stop_model() – the UI just presents it differently."""
     if not _live:
         return jsonify({"error": "live recording unavailable"}), 503
     body = request.get_json(force=True) or {}
@@ -4832,7 +4837,7 @@ def api_live_toggle_all():
 
 @app.route("/api/live/repair", methods=["POST"])
 def api_live_repair():
-    """Kick off a repair job for one model. Returns immediately — the UI
+    """Kick off a repair job for one model. Returns immediately – the UI
     polls /api/live/repair/status for progress."""
     if not _live:
         return jsonify({"error": "live recording unavailable"}), 503
@@ -4850,7 +4855,7 @@ def api_live_repair():
 
 @app.route("/api/live/repair_all", methods=["POST"])
 def api_live_repair_all():
-    """Kick off a full-sweep repair. Returns immediately — poll
+    """Kick off a full-sweep repair. Returns immediately – poll
     /api/live/repair/status for progress (current file, counts so far)."""
     if not _live:
         return jsonify({"error": "live recording unavailable"}), 503
@@ -4888,7 +4893,7 @@ def api_live_repair_status():
 @app.route("/api/tor", methods=["POST"])
 def api_tor():
     """Start the embedded Tor helper, wait for bootstrap, return the SOCKS
-    URL. Called by the UI when user clicks "Use Tor" in the auth panel —
+    URL. Called by the UI when user clicks "Use Tor" in the auth panel –
     the returned URL is auto-filled into config.download_proxy.
 
     Also supports action=stop to kill tor.exe and action=status for a
