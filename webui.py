@@ -3478,14 +3478,14 @@ async function livePause(username, site) {
     try { toast('Error: ' + res.error, 'error'); } catch(_){}
   }
 }
-async function liveOpenFolder(username, siteSlug) {
-  // Recordings live at live_dir/<username> [SLUG]/
-  const folder = `_live/${username} [${siteSlug}]`;
+async function liveOpenFolder(username, site) {
+  // Backend resolves the real recordings folder (on whatever drive
+  // live_output_dir points at, e.g. E:\F\Recordings) and opens it.
   try {
-    await api('/api/open-folder', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({path: folder})});
-    toast(`Opened folder for ${username}`);
-  } catch(e) { toast('Folder not found – no recordings yet?', 'error'); }
+    const res = await apiPostOk('/api/live/open', {username, site});
+    if (res.ok) toast(`Opened folder for ${username}`);
+    else toast('Could not open: ' + (res.error || 'no recordings yet?'), 'error');
+  } catch(e) { toast('Could not open folder', 'error'); }
 }
 
 // ── Live repair: 3-tier ffmpeg pipeline (check → remux → re-encode → delete)
@@ -4481,6 +4481,45 @@ def api_open_folder():
             subprocess.Popen(["open", str(target if target.is_dir() else target.parent)])
         else:
             subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
+    except Exception as e:
+        return jsonify({"error": f"open: {e}"}), 500
+    return jsonify({"ok": True, "opened": str(target)})
+
+
+@app.route("/api/live/open", methods=["POST"])
+def api_live_open():
+    """Open a live model's recordings folder in the file explorer.
+
+    Recordings live wherever live_output_dir points (e.g. E:\\F\\Recordings),
+    which /api/open-folder refuses because it's outside the project dir. This
+    resolves the real folder via the live manager and is confined to the live
+    recordings root."""
+    if not _live:
+        return jsonify({"error": "live recording unavailable"}), 503
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip()
+    site = (body.get("site") or "").strip()
+    if not username or not site:
+        return jsonify({"error": "username + site required"}), 400
+    try:
+        folder = Path(_live.model_folder(username, site)).resolve()
+        root = Path(_live.live_dir).resolve()
+    except Exception as e:
+        return jsonify({"error": f"resolve: {e}"}), 400
+    # Security: confine to the live recordings root.
+    if not str(folder).lower().startswith(str(root).lower()):
+        return jsonify({"error": "path outside live recordings dir"}), 403
+    # Open the model's folder, or the live root if it doesn't exist yet.
+    target = folder if folder.exists() else root
+    if not target.exists():
+        return jsonify({"error": f"not found: {folder}"}), 404
+    try:
+        if sys.platform == "win32":
+            subprocess.Popen(["explorer", str(target)])
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", str(target)])
+        else:
+            subprocess.Popen(["xdg-open", str(target)])
     except Exception as e:
         return jsonify({"error": f"open: {e}"}), 500
     return jsonify({"ok": True, "opened": str(target)})
