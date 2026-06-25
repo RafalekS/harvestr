@@ -462,7 +462,29 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
             # Skip checks during startup grace period
             if (now - attempt_start) < FFSettings.STARTUP_GRACE_SEC:
                 continue
-            
+
+            # No-data abort: a ghost stream (model "online" but serving no real
+            # segments) keeps ffmpeg + its stderr busy for MINUTES while writing
+            # ZERO bytes -- the growth/stderr checks below miss it because stderr
+            # stays active (reconnect logs). If a single-file capture has written
+            # nothing at all within NO_DATA_ABORT_SEC of starting, the stream is
+            # dead: abort the whole recording instead of hanging or burning every
+            # restart attempt. (This is what left a CB card stuck "recording" for
+            # 10 min with only a 0-byte .filename.lock on disk.)
+            _no_data_abort = getattr(FFSettings, 'NO_DATA_ABORT_SEC', 45)
+            if out_path and last_output_size == 0 and \
+               (now - attempt_start) > _no_data_abort:
+                self.logger.warning(
+                    f"No data written in {int(now - attempt_start)}s - aborting "
+                    "(likely offline/ghost stream)")
+                try:
+                    if process and process.poll() is None:
+                        process.kill()
+                except Exception:
+                    pass
+                self.stopDownload = None
+                return False
+
             # Frozen PTS check
             if last_pts_value is not None and \
                (now - last_pts_change) > FFSettings.STALL_SAME_TIME_SEC:

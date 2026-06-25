@@ -748,6 +748,7 @@ class Bot(Thread):
                                 self.logger.exception(e)
                                 ret = False
                             if not ret:
+                                self.recording = False
                                 self.log('Recording ended with error')
                                 self.sc = Status.ERROR
                                 self.log(self.status())
