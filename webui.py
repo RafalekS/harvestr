@@ -3381,6 +3381,22 @@ function relTime(iso) {
   return future ? 'in ' + out : out + ' ago';
 }
 
+// Optimistic Live-tab updates: patch the local snapshot for instant feedback,
+// then reconcile with the server in the background. Avoids a full re-fetch +
+// re-render of every model on each click.
+function _liveLocalPatch(username, site, fn) {
+  try {
+    if (!_liveSnapshot || !Array.isArray(_liveSnapshot.models)) return;
+    const key = username + '|' + site;
+    const i = _liveSnapshot.models.findIndex(m =>
+      m.key === key || (m.username === username && m.site === site));
+    if (i < 0) return;
+    if (fn(_liveSnapshot.models[i]) === false) _liveSnapshot.models.splice(i, 1);
+    renderLiveModels();
+  } catch (_) {}
+}
+function _liveReconcile(ms) { try { setTimeout(liveRefresh, ms || 1200); } catch (_) {} }
+
 async function liveAdd() {
   const username = document.getElementById('live-new-username').value.trim();
   const site = document.getElementById('live-new-site').value;
@@ -3393,7 +3409,23 @@ async function liveAdd() {
   if (res.ok) {
     try { toast(`Tracking ${username} [${site}]`, 'success'); } catch(_){}
     try { document.getElementById('live-new-username').value = ''; } catch(_){}
-    try { liveRefresh(); } catch(_){}
+    // Optimistic: show the new model card immediately, reconcile shortly after.
+    try {
+      if (_liveSnapshot && Array.isArray(_liveSnapshot.models)) {
+        const key = username + '|' + site;
+        if (!_liveSnapshot.models.some(m => m.key === key)) {
+          _liveSnapshot.models.unshift({
+            key, username, site, site_slug: (res.site_slug || site),
+            status: 'NOTRUNNING', status_label: 'starting…', status_color: 'text-3',
+            running: true, recording: false, size_bytes: 0, tags: []
+          });
+          if (_liveSnapshot.summary)
+            _liveSnapshot.summary.total = (_liveSnapshot.summary.total || 0) + 1;
+          renderLiveModels();
+        }
+      }
+    } catch(_){}
+    _liveReconcile(900);
   } else {
     try { toast('Could not add: ' + res.error, 'error'); } catch(_){}
   }
@@ -3407,7 +3439,8 @@ async function liveRemove(username, site) {
   const res = await apiPostOk('/api/live/remove', {username, site});
   if (res.ok) {
     try { toast(`Removed ${username}`); } catch(_){}
-    try { liveRefresh(); } catch(_){}
+    _liveLocalPatch(username, site, () => false);
+    _liveReconcile();
   } else {
     try { toast('Error: ' + res.error, 'error'); } catch(_){}
   }
@@ -3416,7 +3449,8 @@ async function liveStart(username, site) {
   const res = await apiPostOk('/api/live/start', {username, site});
   if (res.ok) {
     try { toast(`Started ${username}`, 'success'); } catch(_){}
-    try { setTimeout(liveRefresh, 400); } catch(_){}
+    _liveLocalPatch(username, site, m => { m.running = true; });
+    _liveReconcile();
   } else {
     try { toast('Error: ' + res.error, 'error'); } catch(_){}
   }
@@ -3425,7 +3459,8 @@ async function liveStop(username, site) {
   const res = await apiPostOk('/api/live/stop', {username, site});
   if (res.ok) {
     try { toast(`Stopped ${username}`); } catch(_){}
-    try { setTimeout(liveRefresh, 400); } catch(_){}
+    _liveLocalPatch(username, site, m => { m.running = false; m.recording = false; });
+    _liveReconcile();
   } else {
     try { toast('Error: ' + res.error, 'error'); } catch(_){}
   }
@@ -3437,7 +3472,8 @@ async function livePause(username, site) {
   const res = await apiPostOk('/api/live/pause', {username, site});
   if (res.ok) {
     try { toast(`Paused ${username}`); } catch(_){}
-    try { setTimeout(liveRefresh, 400); } catch(_){}
+    _liveLocalPatch(username, site, m => { m.running = false; m.recording = false; });
+    _liveReconcile();
   } else {
     try { toast('Error: ' + res.error, 'error'); } catch(_){}
   }
