@@ -3138,6 +3138,14 @@ async function liveRefresh() {
         else if (usedPct >= 80) box.classList.add('warn');
         else box.classList.add('good');
       }
+      // Warn once when the recordings drive is critically full.
+      const crit = (usedPct != null && usedPct >= 92) || lowGb;
+      if (crit && !window._lowDiskWarned) {
+        window._lowDiskWarned = true;
+        try { toast('Recording drive almost full: captures may fail soon', 'error'); } catch (_) {}
+      } else if (!crit) {
+        window._lowDiskWarned = false;
+      }
     }
   } catch (_) {}
   // Top bar "Live" tab badge (only show count when > 0)
