@@ -3202,9 +3202,11 @@ async function liveSummaryRefresh() {
     if (!data || data.available === false) return;
     const s = data.summary || {};
     _liveApplyStats(s);
-    // When the fleet counts change (a model went live / stopped), refresh the
-    // cards immediately so it shows without waiting for the slow tick.
-    const sig = `${s.total}|${s.running}|${s.recording}`;
+    // Refresh cards immediately on STRUCTURAL changes (model added/removed or
+    // started/stopped polling). Deliberately excludes the recording count,
+    // which flickers constantly at scale and would force a full re-render every
+    // tick; the ~12s floor handles recording-state card updates.
+    const sig = `${s.total}|${s.running}`;
     if (sig !== _liveLastSig) {
       _liveLastSig = sig;
       if (_currentPage === 'live') liveRefresh();
