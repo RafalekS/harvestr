@@ -918,6 +918,31 @@ class LiveManager:
             return {"disk_free_bytes": None, "disk_total_bytes": None,
                     "disk_used_pct": None}
 
+    def live_summary(self) -> Dict[str, Any]:
+        """Cheap header stats (counts + bytes + disk + status histogram) without
+        the per-model metadata/history work get_snapshot() does, so the UI can
+        poll it often without rebuilding the full snapshot."""
+        total = running = recording = 0
+        total_bytes = 0
+        status_hist: Dict[str, int] = {}
+        with self._lock:
+            for _, rm in self._models.items():
+                bot = rm.bot
+                total += 1
+                if getattr(bot, "running", False):
+                    running += 1
+                if getattr(bot, "recording", False):
+                    recording += 1
+                total_bytes += int(getattr(bot, "video_files_total_size", 0) or 0)
+                name = getattr(getattr(bot, "sc", None), "name", "UNKNOWN")
+                status_hist[name] = status_hist.get(name, 0) + 1
+        out: Dict[str, Any] = {
+            "total": total, "running": running, "recording": recording,
+            "total_bytes": total_bytes, "status_hist": status_hist,
+        }
+        out.update(self._disk_summary())
+        return out
+
     @staticmethod
     def _scrub_last_info(info: Dict[str, Any]) -> Dict[str, Any]:
         """Strip huge / binary values from bot.lastInfo so it's JSON-safe

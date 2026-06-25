@@ -3147,7 +3147,14 @@ async function liveRefresh() {
       _liveSnapshot.import_error ? 'Error: ' + _liveSnapshot.import_error : '';
     return;
   }
-  const s = _liveSnapshot.summary || {};
+  _liveApplyStats(_liveSnapshot.summary || {});
+  renderLiveModels();
+}
+
+// Apply header stats + disk gauge + tab badge from a summary object. Shared by
+// the full liveRefresh and the lightweight liveSummaryRefresh.
+function _liveApplyStats(s) {
+  s = s || {};
   document.getElementById('live-stat-total').textContent = s.total ?? 0;
   document.getElementById('live-stat-running').textContent = s.running ?? 0;
   document.getElementById('live-stat-recording').textContent = s.recording ?? 0;
@@ -3178,12 +3185,31 @@ async function liveRefresh() {
   } catch (_) {}
   // Top bar "Live" tab badge (only show count when > 0)
   const badge = document.getElementById('tab-live-badge');
-  if ((s.recording || 0) > 0) {
-    badge.textContent = s.recording; badge.hidden = false;
-  } else {
-    badge.hidden = true;
+  if (badge) {
+    if ((s.recording || 0) > 0) { badge.textContent = s.recording; badge.hidden = false; }
+    else { badge.hidden = true; }
   }
-  renderLiveModels();
+}
+
+// Fast stats-only refresh via /api/live/summary (no model list, no card
+// re-render) for snappy header updates between the heavier full refreshes.
+let _liveLastSig = '';
+async function liveSummaryRefresh() {
+  try {
+    const r = await fetch('/api/live/summary');
+    if (!r.ok) return;
+    const data = await r.json();
+    if (!data || data.available === false) return;
+    const s = data.summary || {};
+    _liveApplyStats(s);
+    // When the fleet counts change (a model went live / stopped), refresh the
+    // cards immediately so it shows without waiting for the slow tick.
+    const sig = `${s.total}|${s.running}|${s.recording}`;
+    if (sig !== _liveLastSig) {
+      _liveLastSig = sig;
+      if (_currentPage === 'live') liveRefresh();
+    }
+  } catch (_) {}
 }
 
 function liveSetSort(mode) {
@@ -4154,7 +4180,17 @@ document.addEventListener('keydown', (e) => {
   setInterval(loadAuth, 30000);
   setInterval(loadDisk, 20000);        // disk snapshot every 20s
   // Live polling – only every 3s and only when Live tab visible
-  setInterval(() => { if (_currentPage === 'live') liveRefresh(); }, 3000);
+  // Fast cheap stats poll (/api/live/summary) every 3s; the heavy full card
+  // refresh (/api/live/status) every ~12s as a floor, plus immediately whenever
+  // liveSummaryRefresh detects the counts changed. Stops re-rendering 1000+
+  // cards every 3s while keeping the header and new recordings prompt.
+  let _liveTick = 0;
+  setInterval(() => {
+    if (_currentPage !== 'live') return;
+    _liveTick++;
+    if (_liveTick % 4 === 0) liveRefresh();
+    else liveSummaryRefresh();
+  }, 3000);
   // Always pull ONCE so the "Live" tab badge can update even from Archive tab
   setInterval(async () => {
     if (_currentPage !== 'live') {
@@ -4865,14 +4901,11 @@ def api_live_status():
 @app.route("/api/live/summary")
 def api_live_summary():
     """Lightweight Live stats only (counts + disk + status histogram), no model
-    list. Lets the header poll fast without shipping the full ~660 KB snapshot."""
+    list and no per-model metadata rebuild. Lets the header poll fast + cheap
+    without the full ~660 KB snapshot."""
     if not _live:
         return jsonify({"available": False, "summary": {}})
-    snap = _live_snapshot_cached()
-    return jsonify({
-        "available": snap.get("available", True),
-        "summary": snap.get("summary", {}),
-    })
+    return jsonify({"available": True, "summary": _live.live_summary()})
 
 
 @app.route("/api/live/bulk_add", methods=["POST"])
