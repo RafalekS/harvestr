@@ -4460,10 +4460,17 @@ def api_open_folder():
     except Exception as e:
         return jsonify({"error": f"bad path: {e}"}), 400
 
-    # Security: stay within our downloads tree (or script dir)
+    # Security: stay within our downloads tree (or script dir) — plus the live
+    # recordings root, which may live on another drive (e.g. E:\F\Recordings)
+    # and would otherwise be wrongly blocked.
     roots = [DOWNLOADS_DIR.resolve(), SCRIPT_DIR.resolve()]
+    try:
+        if _live and getattr(_live, "live_dir", None):
+            roots.append(Path(_live.live_dir).resolve())
+    except Exception:
+        pass
     if not any(str(p).lower().startswith(str(r).lower()) for r in roots):
-        return jsonify({"error": "path outside downloads directory"}), 403
+        return jsonify({"error": "path outside allowed directories"}), 403
 
     # If the path doesn't exist but a parent does, open the nearest parent
     target = p if p.exists() else (p.parent if p.parent.exists() else None)
