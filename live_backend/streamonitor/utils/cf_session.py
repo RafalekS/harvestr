@@ -92,18 +92,19 @@ class _HostState:
     """Manages per-host rate limiting, backoff, and session state."""
     
     def __init__(self, domain: str, visit_urls: List[str], profile: str,
-                 impersonate: str = "chrome", logger=None, bot_id: str = ""):
+                 impersonate: str = "chrome", logger=None, bot_id: str = "",
+                 proxy: Optional[str] = None):
         self.domain = domain
         self.visit_urls = visit_urls
         self.profile = profile
         self.bot_id = bot_id
         self.logger = logger
+        self.proxy = proxy
+        self._impersonate = impersonate
 
-        # Async session with reasonable defaults
-        self.sess = crequests.AsyncSession(
-            impersonate=impersonate,
-            timeout=30.0  # Default timeout
-        )
+        # Async session with reasonable defaults. Routed through the bot's
+        # sticky pool proxy when one is configured; direct connection otherwise.
+        self.sess = self._new_session(impersonate)
 
         # Profile-specific settings
         if profile == "api":
@@ -139,18 +140,22 @@ class _HostState:
         self.mint_cooldown = 20 * 60  # 20 minutes
         self.mint_lock = asyncio.Lock()
 
+    def _new_session(self, impersonate: str = "chrome"):
+        """Build a curl_cffi session, routed through self.proxy if one is set."""
+        kwargs = dict(impersonate=impersonate, timeout=30.0)
+        if self.proxy:
+            kwargs["proxies"] = {"http": self.proxy, "https": self.proxy}
+        return crequests.AsyncSession(**kwargs)
+
     async def _reset_session(self):
         """Reset the HTTP session to avoid connection reuse issues (e.g., HTTP/2 stream errors)."""
         try:
             await self.sess.close()
         except Exception:
             pass
-        
-        # Create a fresh session
-        self.sess = crequests.AsyncSession(
-            impersonate="chrome",
-            timeout=30.0
-        )
+
+        # Create a fresh session (same proxy + impersonation as before)
+        self.sess = self._new_session(getattr(self, "_impersonate", "chrome"))
         
         # Reapply headers and cookies to the new session
         # (Assuming we have stored them, otherwise they'll be minted fresh on next request)
@@ -338,13 +343,14 @@ class CFSessionManager:
     Handles async/sync requests transparently.
     """
     
-    def __init__(self, max_age=6 * 3600, logger=None, bot_id: str = "", verify: bool = True):
+    def __init__(self, max_age=6 * 3600, logger=None, bot_id: str = "", verify: bool = True, proxy: Optional[str] = None):
         self.max_age = max_age
         self._hosts: Dict[str, _HostState] = {}
         self._hosts_lock = asyncio.Lock()
         self.logger = logger
         self.bot_id = bot_id
         self.verify = verify
+        self.proxy = proxy
         
         # Bootstrap URLs for cookie minting
         self._bootstrap_urls: Dict[str, List[str]] = {
@@ -366,7 +372,8 @@ class CFSessionManager:
                 visit = self._bootstrap_urls.get(domain, [f"https://{domain}/"])
                 hs = _HostState(
                     domain, visit, profile=bucket,
-                    logger=self.logger, bot_id=self.bot_id
+                    logger=self.logger, bot_id=self.bot_id,
+                    proxy=self.proxy,
                 )
                 
                 # Load or mint cookies

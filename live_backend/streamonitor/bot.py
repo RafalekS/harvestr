@@ -23,6 +23,7 @@ from parameters import (
 from streamonitor.downloaders.ffmpeg import getVideoFfmpeg
 from streamonitor.models import VideoData
 from streamonitor.utils.cf_session import CFSessionManager
+from streamonitor.utils import proxy_pool
 from urllib.parse import urljoin
 import urllib3
 
@@ -167,10 +168,15 @@ class Bot(Thread):
         self.impersonate: Optional[str] = None
         self.cookieUpdater: Optional[Callable[[], bool]] = None
         self.cookie_update_interval: int = 0
+        # Sticky proxy from the optional rotating pool. None when no pool is
+        # configured -> direct connection (unchanged behaviour).
+        self.proxy: Optional[str] = proxy_pool.get_proxy(
+            f"[{self.siteslug}] {self.username}")
         self.session: CFSessionManager = CFSessionManager(
             logger=self.logger,
             bot_id=f"[{self.siteslug}] {self.username}",
-            verify=VERIFY_SSL
+            verify=VERIFY_SSL,
+            proxy=self.proxy,
         )
 
         self._cookie_thread: Optional[Thread] = None

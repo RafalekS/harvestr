@@ -333,6 +333,9 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
                 creationflags = subprocess.CREATE_NEW_PROCESS_GROUP
             
+            _proxy = getattr(self, 'proxy', None)
+            _env = {**os.environ, 'http_proxy': _proxy, 'https_proxy': _proxy,
+                    'HTTP_PROXY': _proxy, 'HTTPS_PROXY': _proxy} if _proxy else None
             process = subprocess.Popen(
                 args=cmd,
                 stdin=subprocess.PIPE,
@@ -341,7 +344,8 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
                 universal_newlines=True,
                 bufsize=0,
                 startupinfo=startupinfo,
-                creationflags=creationflags
+                creationflags=creationflags,
+                env=_env,
             )
             ever_started = True
         except OSError as e:

@@ -349,6 +349,8 @@ def getVideoNativeHLS(self: Bot, url: str, filename: str,  m3u_processor: Option
 
     # Session (not curl_cffi for thread safety)
     sess = requests.Session()
+    if getattr(self, 'proxy', None):
+        sess.proxies.update({'http': self.proxy, 'https': self.proxy})
     if self.cookies:
         try:
             if isinstance(self.cookies, dict):
@@ -568,6 +570,9 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
         except Exception:
             creationflags = 0
 
+    _proxy = getattr(self, 'proxy', None)
+    _env = {**os.environ, 'http_proxy': _proxy, 'https_proxy': _proxy,
+            'HTTP_PROXY': _proxy, 'HTTPS_PROXY': _proxy} if _proxy else None
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.DEVNULL,
@@ -576,6 +581,7 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
         bufsize=1,
         startupinfo=startupinfo,
         creationflags=creationflags,
+        env=_env,
     )
     proc_ref["p"] = proc
 
