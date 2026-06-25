@@ -229,6 +229,26 @@ def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
     root.addHandler(console_handler)
     root.addHandler(file_handler)
 
+    # Persistent ERROR log that survives downloads/ being cleared: a stable
+    # project-level logs/archive-errors.log, daily-rotated and kept ~14 days, so
+    # past errors stay readable even after the run's universal.log is gone.
+    try:
+        from logging.handlers import TimedRotatingFileHandler
+        _err_dir = SCRIPT_DIR / "logs"
+        _err_dir.mkdir(parents=True, exist_ok=True)
+        _err_h = TimedRotatingFileHandler(
+            str(_err_dir / "archive-errors.log"),
+            when="midnight", backupCount=14, encoding="utf-8", delay=True,
+        )
+        _err_h.setLevel(logging.ERROR)
+        _err_h.setFormatter(logging.Formatter(
+            "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.addHandler(_err_h)
+    except Exception:
+        pass
+
     # Silence noisy third-party loggers
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("yt_dlp").setLevel(logging.WARNING)

@@ -26,6 +26,31 @@ except Exception:
     pass
 
 
+# Persistent, retained ERROR log for the live recorder. streamonitor.log keeps
+# everything but is huge and INFO-heavy; this is an errors-only file in the
+# project logs/ dir, daily-rotated and kept ~14 days, so past errors stay easy
+# to read. Added once to the root logger; per-bot loggers propagate to it.
+try:
+    import os as _os
+    from logging.handlers import TimedRotatingFileHandler as _TRFH
+    _err_dir = _os.path.join(
+        _os.path.dirname(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))),
+        "logs",
+    )
+    _os.makedirs(_err_dir, exist_ok=True)
+    _root = logging.getLogger()
+    if not any(getattr(_h, "_live_err_marker", False) for _h in _root.handlers):
+        _eh = _TRFH(_os.path.join(_err_dir, "live-errors.log"),
+                    when="midnight", backupCount=14, encoding="utf-8", delay=True)
+        _eh.setLevel(logging.ERROR)
+        _eh.setFormatter(logging.Formatter(
+            "%(asctime)s - %(levelname)-8s - %(name)s: %(message)s"))
+        _eh._live_err_marker = True
+        _root.addHandler(_eh)
+except Exception:
+    pass
+
+
 class ColoredFormatter(logging.Formatter):
     """Custom formatter that gets colors from the bot instance."""
     
