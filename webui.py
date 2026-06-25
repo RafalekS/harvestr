@@ -3307,12 +3307,31 @@ function renderLiveModels() {
       return renderOne(m);
     } catch (err) {
       console.error('renderLiveModels: card failed for', m && m.key, err);
-      const u = (m && m.username) || '?';
-      const s = (m && m.site) || '?';
-      return `<div class="model-card" style="opacity:.5;">
-        <div class="model-name">${escapeHtml(u)}</div>
-        <div class="status-row"><span class="state-label bad">render error</span>
-          <span class="site-chip">${escapeHtml(s)}</span></div></div>`;
+      // Never show a broken "render error" stub. Fall back to a clean,
+      // in-design card so the model stays visible and controllable even when
+      // an optional field (badges/history/thumbnail) has an odd shape.
+      const u = escapeHtml((m && m.username) || '?');
+      const s = escapeHtml((m && m.site) || '?');
+      const sl = escapeHtml((m && m.status_label) || 'offline');
+      const sc = (m && m.status_color) || 'text-3';
+      const act = (m && m.running)
+        ? `<button class="danger" onclick="liveStop('${u}','${s}')" data-tip="Stop">Stop</button>`
+        : `<button class="success" onclick="liveStart('${u}','${s}')" data-tip="Start polling">Start</button>`;
+      return `<div class="live-card">
+        <div class="top">
+          <span class="username" title="${u}">${u}</span>
+          <span class="site-chip">${s}</span>
+        </div>
+        <div class="status-row">
+          <span class="state-dot ${sc}" aria-hidden="true"></span>
+          <span class="state-label ${sc}">${sl}</span>
+        </div>
+        <div class="actions">${act}
+          <button class="ghost icon-only" onclick="liveRemove('${u}','${s}')" data-tip="Remove" aria-label="Remove">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+          </button>
+        </div>
+      </div>`;
     }
   }).join('');
 }

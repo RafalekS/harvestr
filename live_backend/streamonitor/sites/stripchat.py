@@ -832,8 +832,12 @@ class StripChat(RoomIdBot):
             if end != -1:
                 key = cls._doppio_js_data[start:end]
                 cls._mouflon_keys[pkey] = key
+                # Persist newly-discovered keys so a StripChat key rotation
+                # (upstream issue #359 "pkey has changed again") survives
+                # restarts instead of being re-discovered every launch.
+                cls._saveMouflonKeysToCache()
                 return key
-        
+
         return None
 
     @staticmethod
@@ -1282,7 +1286,7 @@ class StripChat(RoomIdBot):
         
         if not pkey:
             self.logger.error("No mouflon pkey available - keys not extracted at startup?")
-            self.debug(f"Class state: _mouflon_pkey={StripChat._mouflon_pkey}, _mouflon_pdkey={StripChat._mouflon_pdkey}")
+            self.debug(f"Known mouflon keys: {list(StripChat._mouflon_keys.keys())}")
             return []
         
         variants = super().getPlaylistVariants(m3u_data=m3u8_doc)
@@ -1298,32 +1302,17 @@ class StripChat(RoomIdBot):
         result = []
         for variant in variants:
             url = variant['url']
-            
-            # Rewrite media-hls URLs to direct b-hls CDN
-            # From: https://media-hls.doppiocdn.com/b-hls-25/189420462/189420462.m3u8
-            # To:   https://b-hls-25.doppiocdn.live/hls/189420462/189420462.m3u8
-            import re
-            match = re.match(r'https://media-hls\.doppiocdn\.\w+/(b-hls-\d+)/(\d+)/(.+)', url)
-            if match:
-                b_hls_server = match.group(1)  # e.g., b-hls-25
-                stream_id = match.group(2)      # e.g., 189420462
-                filename = match.group(3)       # e.g., 189420462.m3u8?...
-                
-                # Strip any existing query params from filename for reconstruction
-                if '?' in filename:
-                    filename_base = filename.split('?')[0]
-                else:
-                    filename_base = filename
-                
-                # Construct the direct CDN URL with all keys
-                url = f"https://{b_hls_server}.doppiocdn.live/hls/{stream_id}/{filename_base}?psch={psch}&pkey={pkey}&pdkey={pdkey}"
-                self.debug(f"Rewrote variant URL to: {url[:60]}...")
-            else:
-                # URL doesn't match expected pattern - just add keys if missing
-                if 'pkey=' not in url or 'pdkey=' not in url:
-                    sep = '&' if '?' in url else '?'
-                    url = f"{url}{sep}psch={psch}&pkey={pkey}&pdkey={pdkey}"
-            
+            # A previous fork-only rewrite turned the master playlist's
+            # media-hls.doppiocdn.{org,com,net} variant URLs into
+            # b-hls-XX.doppiocdn.live/... — but that CDN domain has been
+            # RETIRED and no longer resolves (NXDOMAIN), so every segment fetch
+            # failed with "getaddrinfo failed". Upstream (lossless1024) uses the
+            # variant URLs exactly as the master returns them and only appends
+            # the mouflon auth params — the original media-hls/edge-hls hosts
+            # resolve fine. Do the same: keep the host, just add the keys.
+            if 'pkey=' not in url or 'pdkey=' not in url:
+                sep = '&' if '?' in url else '?'
+                url = f"{url}{sep}psch={psch}&pkey={pkey}&pdkey={pdkey}"
             result.append(variant | {"url": url})
-        
+
         return result
