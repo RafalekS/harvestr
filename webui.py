@@ -46,6 +46,34 @@ LOG_PATH = DOWNLOADS_DIR / "universal.log"
 
 app = Flask(__name__)
 
+
+@app.after_request
+def _gzip_json(resp):
+    """Transparently gzip large JSON/text responses. The Live status payload is
+    ~660 KB for 1000+ models; gzip drops it to ~10% on the wire. Browsers send
+    Accept-Encoding: gzip and decompress automatically, so it's invisible to the
+    frontend and needs no client change."""
+    try:
+        if 'gzip' not in (request.headers.get('Accept-Encoding') or '').lower():
+            return resp
+        if resp.direct_passthrough or resp.headers.get('Content-Encoding'):
+            return resp
+        ct = resp.content_type or ''
+        if 'application/json' not in ct and 'text/' not in ct:
+            return resp
+        data = resp.get_data()
+        if len(data) < 1024:
+            return resp
+        import gzip as _gzip
+        gz = _gzip.compress(data, 5)
+        resp.set_data(gz)
+        resp.headers['Content-Encoding'] = 'gzip'
+        resp.headers['Content-Length'] = str(len(gz))
+        resp.headers['Vary'] = 'Accept-Encoding'
+    except Exception:
+        pass
+    return resp
+
 # ── Live recording manager (lazy – imports StreaMonitor if available) ────────
 try:
     from live_recording import LiveManager as _LiveManager, available as _live_available
@@ -4808,12 +4836,43 @@ def api_live_sites():
     return jsonify({"available": _live_available, "sites": _live.list_sites()})
 
 
+# Short-lived cache for the heavy live snapshot. Rebuilding it iterates 1000+
+# bots (+ history + metadata) and pegged CPU under frequent / multi-tab polling;
+# a ~1.5 s TTL dedupes bursts with negligible staleness for a dashboard.
+_live_snap_cache = {"ts": 0.0, "data": None}
+
+
+def _live_snapshot_cached():
+    import time as _t
+    now = _t.monotonic()
+    data = _live_snap_cache["data"]
+    if data is not None and (now - _live_snap_cache["ts"]) < 1.5:
+        return data
+    data = _live.get_snapshot()
+    _live_snap_cache["data"] = data
+    _live_snap_cache["ts"] = now
+    return data
+
+
 @app.route("/api/live/status")
 def api_live_status():
-    """Snapshot of every live model and its current state."""
+    """Snapshot of every live model and its current state (cached ~1.5 s)."""
     if not _live:
         return jsonify({"available": False, "models": [], "summary": {}})
-    return jsonify(_live.get_snapshot())
+    return jsonify(_live_snapshot_cached())
+
+
+@app.route("/api/live/summary")
+def api_live_summary():
+    """Lightweight Live stats only (counts + disk + status histogram), no model
+    list. Lets the header poll fast without shipping the full ~660 KB snapshot."""
+    if not _live:
+        return jsonify({"available": False, "summary": {}})
+    snap = _live_snapshot_cached()
+    return jsonify({
+        "available": snap.get("available", True),
+        "summary": snap.get("summary", {}),
+    })
 
 
 @app.route("/api/live/bulk_add", methods=["POST"])
