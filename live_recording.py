@@ -920,27 +920,40 @@ class LiveManager:
 
     def live_summary(self) -> Dict[str, Any]:
         """Cheap header stats (counts + bytes + disk + status histogram) without
-        the per-model metadata/history work get_snapshot() does, so the UI can
-        poll it often without rebuilding the full snapshot."""
-        total = running = recording = 0
+        the per-model metadata/history work get_snapshot() does.
+
+        Cached ~1.5 s AND computed OUTSIDE the models lock (we hold it only to
+        snapshot the bot list), so a lock held long by get_snapshot during the
+        startup CPU crunch or heavy polling can't stall this fast endpoint —
+        which is what made it time out at scale."""
+        import time as _t
+        now = _t.monotonic()
+        cache = getattr(self, "_summary_cache", None)
+        if cache is None:
+            cache = self._summary_cache = {"ts": 0.0, "data": None}
+        if cache["data"] is not None and (now - cache["ts"]) < 1.5:
+            return cache["data"]
+        # Brief lock: just grab the bot references, then tally without it.
+        with self._lock:
+            bots = [rm.bot for rm in self._models.values()]
+        running = recording = 0
         total_bytes = 0
         status_hist: Dict[str, int] = {}
-        with self._lock:
-            for _, rm in self._models.items():
-                bot = rm.bot
-                total += 1
-                if getattr(bot, "running", False):
-                    running += 1
-                if getattr(bot, "recording", False):
-                    recording += 1
-                total_bytes += int(getattr(bot, "video_files_total_size", 0) or 0)
-                name = getattr(getattr(bot, "sc", None), "name", "UNKNOWN")
-                status_hist[name] = status_hist.get(name, 0) + 1
+        for bot in bots:
+            if getattr(bot, "running", False):
+                running += 1
+            if getattr(bot, "recording", False):
+                recording += 1
+            total_bytes += int(getattr(bot, "video_files_total_size", 0) or 0)
+            name = getattr(getattr(bot, "sc", None), "name", "UNKNOWN")
+            status_hist[name] = status_hist.get(name, 0) + 1
         out: Dict[str, Any] = {
-            "total": total, "running": running, "recording": recording,
+            "total": len(bots), "running": running, "recording": recording,
             "total_bytes": total_bytes, "status_hist": status_hist,
         }
         out.update(self._disk_summary())
+        cache["data"] = out
+        cache["ts"] = now
         return out
 
     @staticmethod
