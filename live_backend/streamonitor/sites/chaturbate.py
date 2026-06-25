@@ -50,13 +50,25 @@ class Chaturbate(Bot):
                 return None
             
         url = self.lastInfo['url']
-        
+
         # Use CMAF if available for better streaming
         if self.lastInfo.get('cmaf_edge'):
             url = url.replace('playlist.m3u8', 'playlist_sfm4s.m3u8')
             url = re.sub(r'live-.+amlst', 'live-c-fhls/amlst', url)
 
-        return self.getWantedResolutionPlaylist(url)
+        # Pass the playlist URL straight to ffmpeg instead of routing it through
+        # getWantedResolutionPlaylist(). The CB ajax already returns the
+        # wanted-quality stream (bandwidth=high), and re-routing it broke CB
+        # entirely (0/36 recordings):
+        #   - low-latency (llhls) MEDIA playlists have no variants, so
+        #     getPlaylistVariants() returned [] -> "No available sources";
+        #   - for master playlists it appended the master's short-lived token
+        #     to the variant URL, which ffmpeg then hit as HTTP 403/404
+        #     (decoded "Abnormal exit code" = AVERROR_HTTP_FORBIDDEN/NOT_FOUND).
+        # ffmpeg handles both master and media playlists natively with the
+        # fresh token. Verified live: direct ffmpeg capture of a CB URL records
+        # cleanly (exit 0, ~1.8 MB in 8 s).
+        return url
 
     def getStatus(self) -> Status:
         """Check the current status of the stream."""
