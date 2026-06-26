@@ -213,6 +213,11 @@ class Bot(Thread):
         # already scanned by its own post-recording call (no double scan).
         self._video_lock: Lock = Lock()
         self._video_files_scanned: bool = False
+        # Whether this bot was created during LiveManager's bulk startup restore
+        # (suppress_boot_poll is True only then). Boot bots stagger their first
+        # poll to avoid a thundering herd; a bot ADDED later via the UI is a
+        # single bot with no herd, so it skips the stagger and records promptly.
+        self._is_boot_bot: bool = bool(type(self).suppress_boot_poll)
         self.isRetryingDownload: bool = False
         
         self.verify_with_ffprobe: bool = True
@@ -714,9 +719,14 @@ class Bot(Thread):
             from streamonitor.enums import Status as _S
             _was_active = self.previous_status in (_S.PUBLIC, _S.RECORDING) \
                           if hasattr(self, "previous_status") and self.previous_status else False
-            _stagger = _r.uniform(0, 30) if _was_active else _r.uniform(0, 300)
+            if not getattr(self, "_is_boot_bot", True):
+                # Added via the UI after boot -> single bot, no thundering herd.
+                # Record promptly instead of waiting up to 5 min.
+                _stagger = 0.0
+            else:
+                _stagger = _r.uniform(0, 30) if _was_active else _r.uniform(0, 300)
             self.logger.verbose(f"Bot main loop starting (stagger {_stagger:.1f}s, "
-                                  f"was_active={_was_active})")
+                                  f"was_active={_was_active} boot={getattr(self,'_is_boot_bot',True)})")
             self._sleep(_stagger)
 
             # Initialize offline accumulator (instance attr so restart()
