@@ -1269,13 +1269,15 @@ class StripChat(RoomIdBot):
                 if result.status_code == 200:
                     break
                 elif result.status_code == 404:
-                    self.logger.warning(f"Playlist not found on {host}, trying next CDN...")
+                    # Per-host failover noise (fires 3x for every offline model);
+                    # the genuinely-stuck case escalates via the run-loop 3-strike.
+                    self.logger.debug(f"Playlist not found on {host}, trying next CDN...")
                     result = None
                 else:
-                    self.logger.warning(f"Unexpected status {result.status_code} from {host}")
+                    self.logger.debug(f"Unexpected status {result.status_code} from {host}")
                     result = None
             except Exception as e:
-                self.logger.warning(f"Failed to fetch from {host}: {e}")
+                self.logger.debug(f"Failed to fetch from {host}: {e}")
                 result = None
         
         if not result or result.status_code != 200:
