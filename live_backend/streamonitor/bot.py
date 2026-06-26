@@ -826,12 +826,16 @@ class Bot(Thread):
                                 self._consec_dl_fail += 1
                                 if self._consec_dl_fail >= 3:
                                     self.sc = Status.ERROR
-                                    self.logger.warning(self.status())
+                                    if self._consec_dl_fail == 3:  # log ONCE on escalation, not every cycle
+                                        self.logger.warning(self.status())
                                 else:
                                     self.logger.debug(
                                         f'No stream URL (likely left public); re-polling '
                                         f'[{self._consec_dl_fail}/3]')
-                                self._sleep(self.sleep_on_error)
+                                # Back off a stuck-but-"public" model (e.g. ticket/private
+                                # show the affiliate API still lists as online) so it
+                                # doesn't retry and re-log every cycle.
+                                self._sleep(self.sleep_on_error * min(self._consec_dl_fail, 4))
                                 continue
                             self.log('Started downloading show')
                             self.recording = True
@@ -850,13 +854,14 @@ class Bot(Thread):
                                 self._consec_dl_fail += 1
                                 if self._consec_dl_fail >= 3:
                                     self.sc = Status.ERROR
-                                    self.log('Recording ended with error')
-                                    self.log(self.status())
+                                    if self._consec_dl_fail == 3:  # log ONCE on escalation
+                                        self.log('Recording ended with error')
+                                        self.log(self.status())
                                 else:
                                     self.logger.debug(
                                         f'Recording ended early (transient); re-polling '
                                         f'[{self._consec_dl_fail}/3]')
-                                self._sleep(self.sleep_on_error)
+                                self._sleep(self.sleep_on_error * min(self._consec_dl_fail, 4))
                                 continue
                             self.recording = False
                             self._consec_dl_fail = 0
@@ -934,8 +939,9 @@ class Bot(Thread):
                     if result.status_code != 200:
                         # Transient most of the time (model left -> 404, private ->
                         # 403). The run loop's consecutive-failure gate escalates a
-                        # genuinely-stuck model, so keep this off ERROR.
-                        self.logger.warning(f"Failed to fetch playlist: HTTP {result.status_code}")
+                        # genuinely-stuck model (ERROR badge in the UI), so this
+                        # per-blip line is debug-only to keep the log quiet.
+                        self.logger.debug(f"Playlist fetch HTTP {result.status_code} (transient)")
                         return None
                     
                     m3u8_doc = result.text

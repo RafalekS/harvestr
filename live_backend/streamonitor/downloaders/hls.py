@@ -196,7 +196,7 @@ class _RollingM3UWriter:
                     # Special handling for 403 - likely private show
                     if r.status_code == 403:
                         if self.logger:
-                            self.logger.warning("Playlist access forbidden (403) - likely private show")
+                            self.logger.debug("Playlist access forbidden (403) - likely private show")
                         
                         # Trigger status recheck if bot instance is available
                         if self.bot_instance and hasattr(self.bot_instance, 'getStatus'):
@@ -215,7 +215,7 @@ class _RollingM3UWriter:
                         break
                     
                     if self.logger and consecutive_errors <= 3:
-                        self.logger.warning(f"Playlist fetch returned {r.status_code}")
+                        self.logger.debug(f"Playlist fetch returned {r.status_code}")
 
                     if consecutive_errors >= max_errors and not _in_vpn_grace():
                         self._error = f"Too many failed fetches ({consecutive_errors})"
@@ -236,7 +236,7 @@ class _RollingM3UWriter:
                 # Validate it's actually a playlist
                 if not txt.strip() or "#EXTM3U" not in txt:
                     if self.logger:
-                        self.logger.warning("Invalid playlist format")
+                        self.logger.debug("Invalid playlist format")
                     time.sleep(self.poll_sec)
                     continue
                 
@@ -273,7 +273,7 @@ class _RollingM3UWriter:
             except requests.RequestException as e:
                 consecutive_errors += 1
                 if self.logger and consecutive_errors <= 3:
-                    self.logger.warning(f"Playlist fetch error: {e}")
+                    self.logger.debug(f"Playlist fetch error: {e}")
 
                 if consecutive_errors >= max_errors and not _in_vpn_grace():
                     self._error = f"Network errors: {e}"
@@ -405,7 +405,7 @@ def getVideoNativeHLS(self: Bot, url: str, filename: str,  m3u_processor: Option
     # Resolve master
     text0, code0 = fetch_text(url)
     if text0 is None:
-        self.logger.warning(f"Master fetch failed ({code0}), trying direct FFmpeg")
+        self.logger.debug(f"Master fetch failed ({code0}), trying direct FFmpeg")
         ok = _ffmpeg_dump_to_ts(self, url, headers, output_path, ffmpeg_proc_ref)
         try:
             sess.close()
@@ -429,7 +429,7 @@ def getVideoNativeHLS(self: Bot, url: str, filename: str,  m3u_processor: Option
     # Fetch media playlist
     text1, code1 = fetch_text(url)
     if text1 is None:
-        self.logger.warning(f"Media fetch failed ({code1}), trying direct FFmpeg")
+        self.logger.debug(f"Media fetch failed ({code1}), trying direct FFmpeg")
         ok = _ffmpeg_dump_to_ts(self, url, headers, output_path, ffmpeg_proc_ref)
         try:
             sess.close()

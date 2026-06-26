@@ -1281,9 +1281,10 @@ class StripChat(RoomIdBot):
         if not result or result.status_code != 200:
             # Almost always the model left public between the status poll and this
             # fetch (master 404s on every host) or a private show (403) or a
-            # transient doppiocdn DNS blip. The run loop escalates to ERROR only
-            # after consecutive failures, so this stays a WARNING, not an ERROR.
-            self.logger.warning("Failed to fetch playlist from any CDN host (model likely left / private)")
+            # transient doppiocdn DNS blip. The run loop escalates to ERROR (UI
+            # badge) only after consecutive failures, so this per-blip line is
+            # debug-only -- it was firing ~per second across the SC fleet.
+            self.logger.debug("Failed to fetch playlist from any CDN host (model likely left / private)")
             return []
             
         m3u8_doc = result.text
