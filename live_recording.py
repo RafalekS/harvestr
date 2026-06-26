@@ -366,9 +366,26 @@ class LiveManager:
             if Bot is not None:
                 try:
                     Bot.defer_init_scan = False
-                    Bot.suppress_boot_poll = False
                 except Exception:
                     pass
+        # Keep suppress_boot_poll TRUE for a short window AFTER restore, then
+        # reset it in the background, so the bulk poller covers the restored bots
+        # BEFORE they could self-poll. Otherwise 1000+ bulk bots fire getStatus
+        # in the gap between restore and the first bulk poll -- a burst that
+        # flagged the exit IP (seen as 500+ models RATELIMIT right after boot).
+        # UI-added bots (created after this resets) still self-poll for a prompt
+        # initial status.
+        if Bot is not None:
+            def _unsuppress():
+                import time as _t
+                _t.sleep(45)
+                try:
+                    Bot.suppress_boot_poll = False
+                    log.info("[live] bulk self-poll re-enabled (boot window over)")
+                except Exception:
+                    pass
+            threading.Thread(target=_unsuppress, name="live-unsuppress",
+                             daemon=True).start()
         # Spawn the bulk-status poller so bulk-update sites (Chaturbate,
         # CamSoda, StripChat) get ongoing status checks. Without this,
         # bulk-update bots only ever do a single getStatus() at startup
