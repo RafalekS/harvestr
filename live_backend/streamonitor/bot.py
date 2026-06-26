@@ -720,7 +720,16 @@ class Bot(Thread):
             while self.running and not self.quitting:
                 try:
                     self.recording = False
-                    if not self.bulk_update or self.sc == Status.NOTRUNNING:
+                    # Bulk-update sites (CB/SC/CS) get their status from the
+                    # LiveManager bulk poller (ONE API call per site, not per
+                    # bot), so they must not self-poll getStatus here. The old
+                    # `sc == NOTRUNNING` clause made every one of 1000+ bulk bots
+                    # fire an individual getStatus at startup -- a burst that
+                    # (especially CB via the residential proxy, with retries)
+                    # saturated the GIL and stalled _restore()/app.run() for
+                    # MINUTES, so the dashboard port never came up. Non-bulk
+                    # sites have no bulk poller, so they still self-poll.
+                    if not self.bulk_update:
                         try:
                             self.sc = self.getStatus()
                         except Exception as e:
