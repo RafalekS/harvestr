@@ -68,6 +68,26 @@ class Chaturbate(Bot):
         # ffmpeg handles both master and media playlists natively with the
         # fresh token. Verified live: direct ffmpeg capture of a CB URL records
         # cleanly (exit 0, ~1.8 MB in 8 s).
+
+        # ROOT-CAUSE guard for "online but not downloading": CB's ajax reports
+        # room_status=public + a URL+token even when the model's stream isn't on
+        # the edge CDN yet (origin not replicated, or it just dropped). The edge
+        # then returns 504 "context deadline exceeded" / 403 "stream_missed", so
+        # ffmpeg gets a dead URL -- which is exactly why a model can sit
+        # "recording" while writing 0 bytes. Probe the edge first; if the stream
+        # isn't actually there, return None so the bot re-polls and records once
+        # it genuinely appears, instead of spawning a doomed capture.
+        try:
+            probe = self.session.get(url, headers=self.headers, bucket='hls', timeout=10)
+            if probe.status_code != 200:
+                self.logger.info(
+                    f"Stream not on edge yet (HTTP {probe.status_code}); "
+                    "skipping until it appears")
+                return None
+        except Exception as e:
+            # Inconclusive (network blip) -- let ffmpeg try; the no-data
+            # watchdog is the backstop.
+            self.logger.debug(f"Edge probe inconclusive: {e}")
         return url
 
     def getStatus(self) -> Status:
