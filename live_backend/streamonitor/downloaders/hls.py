@@ -570,7 +570,13 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
         except Exception:
             creationflags = 0
 
-    _proxy = getattr(self, 'proxy', None)
+    # capture_via_proxy=False (Chaturbate): the writer already fetched the
+    # fingerprint-blocked playlist via the proxy, but the SEGMENTS aren't IP-
+    # bound and ffmpeg can't use an AUTHENTICATED proxy via http_proxy env -- so
+    # let ffmpeg pull segments DIRECT (fast, unlimited exit) while only the
+    # Cloudflare-gated ajax + playlist went through the proxy. Verified: chunklist
+    # via proxy + segment via direct exit both return 200.
+    _proxy = getattr(self, 'proxy', None) if getattr(self, 'capture_via_proxy', True) else None
     _env = {**os.environ, 'http_proxy': _proxy, 'https_proxy': _proxy,
             'HTTP_PROXY': _proxy, 'HTTPS_PROXY': _proxy} if _proxy else None
     proc = subprocess.Popen(

@@ -20,6 +20,7 @@
 
 import os
 import re
+import json
 import threading
 import itertools
 from pathlib import Path
@@ -29,6 +30,7 @@ _lock = threading.Lock()
 _proxies: Optional[List[str]] = None
 _rr = None
 _sticky: Dict[str, str] = {}
+_site_proxies: Optional[Dict[str, str]] = None
 
 
 def _project_root() -> Path:
@@ -67,8 +69,50 @@ def _load() -> List[str]:
         return _proxies
 
 
+def _load_site_proxies() -> Dict[str, str]:
+    """Per-SITE proxy overrides (e.g. route all Chaturbate traffic through one
+    residential ISP IP because CB's Cloudflare bans datacenter/VPN exit IPs and
+    its edge token is IP-bound, so status ajax + segment capture must share one
+    exit). Merged (env wins) from:
+      1. ``site_proxies.json`` at the project root  -> {"CB": "http://u:p@host:port"}
+      2. STRMNTR_SITE_PROXIES env (same JSON shape)
+    Keys are site slugs (CB, SC, CS, ...), upper-cased. Empty -> no overrides."""
+    global _site_proxies
+    if _site_proxies is not None:
+        return _site_proxies
+    with _lock:
+        if _site_proxies is not None:
+            return _site_proxies
+        sp: Dict[str, str] = {}
+        try:
+            f = _project_root() / "site_proxies.json"
+            if f.exists():
+                data = json.loads(f.read_text(encoding="utf-8"))
+                sp.update({str(k).upper(): str(v) for k, v in data.items() if v})
+        except Exception:
+            pass
+        try:
+            env = os.environ.get("STRMNTR_SITE_PROXIES", "") or ""
+            if env.strip():
+                data = json.loads(env)
+                sp.update({str(k).upper(): str(v) for k, v in data.items() if v})
+        except Exception:
+            pass
+        _site_proxies = sp
+        return _site_proxies
+
+
+def _siteslug_of(key: Optional[str]) -> Optional[str]:
+    """Extract the site slug from a bot key formatted as ``[SLUG] username``."""
+    if key and key.startswith("["):
+        end = key.find("]")
+        if end > 1:
+            return key[1:end].strip().upper()
+    return None
+
+
 def has_proxies() -> bool:
-    return bool(_load())
+    return bool(_load()) or bool(_load_site_proxies())
 
 
 def count() -> int:
@@ -80,7 +124,16 @@ def get_proxy(key: Optional[str] = None) -> Optional[str]:
 
     Sticky: the same ``key`` always maps to the same proxy. New keys are
     handed out round-robin so the fleet spreads evenly across exit IPs.
+
+    A per-site override (site_proxies.json / STRMNTR_SITE_PROXIES) takes
+    precedence: every bot of that site gets the SAME dedicated exit (needed for
+    Chaturbate, whose edge token is IP-bound), regardless of the round-robin pool.
     """
+    slug = _siteslug_of(key)
+    if slug:
+        site = _load_site_proxies()
+        if slug in site:
+            return site[slug]
     pool = _load()
     if not pool:
         return None

@@ -31,6 +31,9 @@ cookies_*.txt
 config.json
 config.json.*
 !config.example.json
+# Proxy config (contains credentials — never commit)
+site_proxies.json
+proxies.txt
 # Streamonitor's vendored config (live model list — usernames/room_ids)
 live_backend/config.json
 live_backend/config.json.*

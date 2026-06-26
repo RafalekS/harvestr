@@ -32,6 +32,11 @@ class Chaturbate(Bot):
         # feeds ffmpeg LOCALLY, bypassing the ffmpeg-HTTP block. Verified live:
         # 2 MB in 16s via this path where direct ffmpeg got 0 bytes / HTTP 403.
         self.getVideo = getVideoNativeHLS
+        # Pull SEGMENTS direct, not through the residential proxy: they aren't
+        # IP-bound, ffmpeg can't authenticate to the proxy, and segment bandwidth
+        # is large. Only the Cloudflare-gated ajax + playlist go via the proxy
+        # (proxy_pool site override for CB); segments use the fast direct exit.
+        self.capture_via_proxy = False
     
     def get_site_color(self):
         """Return the color scheme for this site"""
