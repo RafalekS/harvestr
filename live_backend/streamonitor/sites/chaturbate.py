@@ -115,6 +115,12 @@ class Chaturbate(Bot):
                 # Treat server errors as temporary (ratelimit) not permanent errors
                 if response.status_code >= 500 or response.status_code == 429:
                     return Status.RATELIMIT
+                elif response.status_code == 403:
+                    # Cloudflare challenge / IP-reputation block ("Just a
+                    # moment..."). Back off on the ratelimit cadence instead of
+                    # fast ERROR retries, so the fleet stops hammering a flagged
+                    # exit IP and making the block worse / longer.
+                    return Status.RATELIMIT
                 elif response.status_code == 404:
                     return Status.NOTEXIST
                 return Status.ERROR
@@ -193,10 +199,16 @@ class Chaturbate(Bot):
                 if model_data.get('country'):
                     streamer.country = model_data.get('country', '').upper()
                 status = cls._parseStatus(model_data.get('current_show', ''))
-                if status == Status.PUBLIC:
-                    if streamer.sc in (Status.PUBLIC, Status.RESTRICTED):
-                        continue
-                    status = streamer.getStatus()
+                # Trust the affiliates current_show for status. We deliberately
+                # do NOT spend a per-model get_edge_hls_url_ajax to "confirm"
+                # PUBLIC here: that ajax (Cloudflare-gated chaturbate.com) across
+                # 600+ bots is what flags the VPN exit IP into a site-wide 403
+                # ("Just a moment..."). The stream URL is fetched lazily at
+                # recording start (getVideoUrl), so confirming here is pure
+                # wasted Cloudflare exposure. Keep the skip for already-live bots
+                # so we never disturb an in-progress recording.
+                if status == Status.PUBLIC and streamer.sc in (Status.PUBLIC, Status.RESTRICTED):
+                    continue
                 streamer.setStatus(status)
         except Exception as e:
             # Silently fail for bulk — individual bots will still poll on their own
