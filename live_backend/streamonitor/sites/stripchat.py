@@ -1196,10 +1196,24 @@ class StripChat(RoomIdBot):
         is_cam_active = self._get_by_path(self.lastInfo, ["isCamActive"]) or \
                        self._get_by_path(self.lastInfo, ["cam", "isCamActive"]) or False
 
-        # Only return PUBLIC if status is public AND camera is available AND active
-        # This prevents downloading promotional videos when model is offline
-        if status == "public" and is_cam_available and is_cam_active:
+        # A model can be "public" + cam-active yet NOT actually broadcasting --
+        # paused, between streams, or a ticket show -- with isLive False and an
+        # EMPTY streamName. Marking that PUBLIC makes the recorder build a master
+        # URL that 404s on every CDN host, burning retries into ERROR (this is
+        # what stranded __Naomi at ERROR). Gate PUBLIC on a real stream: if
+        # there's no streamName, it's not recordable -> treat as OFFLINE and wait
+        # for the model to actually go live (the next poll picks it up).
+        try:
+            _stream_name = self.getStreamName()
+        except Exception:
+            _stream_name = None
+
+        # Only return PUBLIC if status is public AND camera is available AND
+        # active AND there is an actual stream to record.
+        if status == "public" and is_cam_available and is_cam_active and _stream_name:
             return Status.PUBLIC
+        if status == "public" and (is_cam_active or is_cam_available) and not _stream_name:
+            return Status.OFFLINE
 
         if status in self._PRIVATE_STATUSES:
             return Status.PRIVATE
