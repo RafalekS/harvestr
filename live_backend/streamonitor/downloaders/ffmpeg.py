@@ -482,11 +482,17 @@ def getVideoFfmpeg(self: 'Bot', url: str, filename: str) -> bool:
             if (now - attempt_start) < FFSettings.STARTUP_GRACE_SEC:
                 continue
 
-            # Ride through a VPN rotation: the Mullvad tunnel is briefly down, so
-            # skip every stall/no-data abort below. ffmpeg's -reconnect keeps
-            # retrying and resumes the SAME file on the new IP; without this the
-            # frozen-PTS (20s) check would kill it mid-gap and split the file.
+            # Ride through a VPN rotation: the Mullvad tunnel is briefly down.
+            # Skip the stall/no-data aborts AND push the stall timers forward so
+            # the gap isn't counted and the stream gets a full fresh window to
+            # resume on the new IP after grace ends (else it stall-aborts the
+            # instant grace expires). ffmpeg's -reconnect resumes the SAME file.
             if _in_vpn_grace():
+                last_pts_change = now
+                last_output_growth = now
+                last_stderr_activity = now
+                low_speed_start = None
+                suspect_trigger = None
                 continue
 
             # No-data abort: a ghost stream (model "online" but serving no real

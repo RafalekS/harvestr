@@ -642,10 +642,14 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
         last_sz = 0
         last_growth = start
         while not _wd_stop.wait(5):
-            # Ride through a VPN rotation: the tunnel is briefly down, so don't
-            # count the gap as no-data/stall. ffmpeg's seg_max_retry resumes the
-            # SAME .tmp.ts on the new IP; the next post-grace poll sees it grow.
+            # Ride through a VPN rotation: the tunnel is briefly down. Skip the
+            # abort AND push the stall timers forward, so the gap isn't counted
+            # and the stream gets a FULL fresh window to resume on the new IP
+            # after grace ends -- otherwise a stream that wedged on the bounce
+            # would abort the instant grace expires (the split we saw in testing).
             if _in_vpn_grace():
+                start = time.monotonic()
+                last_growth = time.monotonic()
                 continue
             try:
                 sz = os.path.getsize(out_path) if os.path.exists(out_path) else 0
