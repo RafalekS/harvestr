@@ -64,6 +64,13 @@ class LiveHistory:
         self._data: Dict[str, Any] = {"models": {}, "updated_at": _iso(_now())}
         self._last_status: Dict[str, str] = {}   # key -> last recorded status
         self._lock = threading.Lock()
+        # Memoized snapshot() results. _compute_metrics is O(|transitions|) and
+        # get_snapshot() calls snapshot() per-model across 1000+ models on every
+        # /api/live/status poll -- an un-cached recompute that timed out the
+        # endpoint at scale. Invalidated when a transition is appended (the
+        # (len, last_ts) key changes) and by a short TTL for the few
+        # wall-clock-relative fields. key -> (n, last_ts, mono_ts, result).
+        self._snap_cache: Dict[str, tuple] = {}
         self._load()
 
     def _load(self) -> None:
@@ -138,14 +145,28 @@ class LiveHistory:
     # ── queries ──────────────────────────────────────────────────────
 
     def snapshot(self, key: str) -> Dict[str, Any]:
-        """Return derived metrics for one model. O(|transitions|) each call."""
+        """Return derived metrics for one model. _compute_metrics is
+        O(|transitions|); memoize it. The result only changes when record()
+        appends a transition (so the (len, last_ts) cache key changes) or, for
+        the wall-clock-relative fields, after a short TTL. Without this the
+        per-model recompute across 1000+ models timed out /api/live/status."""
+        import time as _t
         with self._lock:
             entry = self._data["models"].get(key)
             if not entry:
                 return {}
             txs = entry.get("transitions") or []
             meta = dict(entry.get("meta") or {})
-        return _compute_metrics(txs, meta)
+            n = len(txs)
+            last_ts = txs[-1].get("ts", "") if txs else ""
+            now = _t.monotonic()
+            cached = self._snap_cache.get(key)
+            if (cached and cached[0] == n and cached[1] == last_ts
+                    and (now - cached[2]) < 30.0):
+                return cached[3]
+            result = _compute_metrics(txs, meta)
+            self._snap_cache[key] = (n, last_ts, now, result)
+            return result
 
     def snapshot_all(self) -> Dict[str, Dict[str, Any]]:
         """Return derived metrics for every tracked model."""

@@ -316,6 +316,12 @@ def getVideoNativeHLS(self: Bot, url: str, filename: str,  m3u_processor: Option
     Robust HLS capture that writes to .tmp.ts for post-processing.
     NO RENAME - file stays as .tmp.ts for external post-processing.
     """
+    # A model that just left public yields an empty/None URL (getVideoUrl
+    # returns no URL when room_status != public). Don't fetch '' -> that logged
+    # "Fetch failed: Invalid URL ''" at ERROR; it's an expected transition.
+    if not url:
+        self.logger.debug("No stream URL (model left public) - skipping capture")
+        return False
     self.stopDownloadFlag = False
     writer_ref = {"w": None}
     ffmpeg_proc_ref = {"p": None}
@@ -653,9 +659,20 @@ def _ffmpeg_dump_to_ts(self: Bot, url_or_path: str, headers: Dict[str, str], out
                 continue
             if DEBUG:
                 self.logger.debug(f"[ffmpeg] {line}")
-            if "invalid" in line.lower() or "error" in line.lower():
+            low = line.lower()
+            if "invalid" in low or "error" in low:
                 if "No such" in line or "failed" in line:
-                    self.logger.error(f"FFmpeg error: {line}")
+                    # ffmpeg surfaces transient, self-recovering HLS hiccups on
+                    # stderr ("keepalive request failed ... retrying with new
+                    # connection", segment I/O errors it retries). These do NOT
+                    # fail the capture (the watchdog/writer own that), so they're
+                    # benign edge churn -- log at DEBUG, not ERROR, so they stop
+                    # reading as a flood of [CB]/[SC] errors. Genuine non-retry
+                    # failures still surface at ERROR.
+                    if "retry" in low or "keepalive" in low or "reconnect" in low:
+                        self.logger.debug(f"[ffmpeg] transient: {line}")
+                    else:
+                        self.logger.error(f"FFmpeg error: {line}")
     except Exception:
         pass
 
