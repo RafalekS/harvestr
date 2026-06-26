@@ -4719,6 +4719,13 @@ def api_live_netconfig_rotate():
         try:
             loc = _vpn.rotate(reason="manual (UI)", log=lambda m: _log.warning(m))
             _log.warning(f"[vpn] manual rotation complete -> {loc}")
+            if loc and _live:
+                # exit IP changed -> restart IP-bound (StripChat) captures so they
+                # fetch a fresh token now instead of stalling ~60s.
+                try:
+                    _live.restart_ip_bound_recordings()
+                except Exception:
+                    pass
         except Exception as e:
             _log.warning(f"[vpn] manual rotation failed: {e}")
     _th.Thread(target=_do, name="vpn-manual-rotate", daemon=True).start()

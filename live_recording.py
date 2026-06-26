@@ -478,6 +478,9 @@ class LiveManager:
                                               log=lambda m: log.warning(m))
                             if loc:
                                 self._wake_site_bots(slug)
+                                # IP changed -> restart IP-bound (StripChat) captures
+                                # now so they grab a fresh token instead of stalling.
+                                self.restart_ip_bound_recordings()
                             break  # at most one rotation per cycle
                         elif _vpn.should_restart(slug):
                             # TIER 1: restart (wake) the bots on the SAME IP first
@@ -513,6 +516,33 @@ class LiveManager:
             log.info(f"[live] woke {len(bots)} [{site_slug}] bots after VPN rotation")
         except Exception as e:
             log.debug(f"[live] wake bots: {e}")
+
+    def restart_ip_bound_recordings(self) -> None:
+        """After a VPN rotation the exit IP changed, so sites whose stream tokens
+        are bound to the IP (StripChat/doppiocdn -> tokens_ip_bound) now hold a
+        DEAD token and can't ride through. Stop those active captures so each
+        bot's run loop immediately re-fetches a FRESH token on the new IP (a few
+        seconds) instead of waiting ~60s for the stall watchdog. Sites that ride
+        through (Chaturbate: segments not IP-bound) are deliberately left alone."""
+        try:
+            with self._lock:
+                bots = [rm.bot for rm in self._models.values()
+                        if getattr(rm.bot, "tokens_ip_bound", False)
+                        and getattr(rm.bot, "recording", False)]
+            n = 0
+            for bot in bots:
+                sd = getattr(bot, "stopDownload", None)
+                if callable(sd):
+                    try:
+                        sd()
+                        n += 1
+                    except Exception:
+                        pass
+            if n:
+                log.info(f"[live] restarted {n} IP-bound recording(s) for a fresh "
+                         "token after VPN rotation")
+        except Exception as e:
+            log.debug(f"[live] restart ip-bound: {e}")
 
     def _start_bulk_poller(self):
         """Start a daemon thread that calls each bulk-capable site's

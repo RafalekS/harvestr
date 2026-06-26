@@ -86,6 +86,10 @@ class StripChat(RoomIdBot):
         super().__init__(username, room_id=room_id)
         self.vr = False
         self.getVideo = lambda _, url, filename: getVideoNativeHLS(self, url, filename, StripChat.m3u_decoder)
+        # doppiocdn stream tokens are bound to the exit IP, so a VPN rotation kills
+        # the in-flight token -- the capture can't ride through; the LiveManager
+        # restarts it on rotation to grab a fresh token (see tokens_ip_bound).
+        self.tokens_ip_bound = True
 
     def get_site_color(self):
         """Return the color scheme for this site"""

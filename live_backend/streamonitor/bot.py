@@ -115,6 +115,14 @@ class Bot(Thread):
     suppress_boot_poll: bool = False
     ratelimit: bool = False
     bulk_update: bool = False  # Override True in sites that support bulk status updates
+    # When True, this site's stream tokens are bound to the exit IP (e.g.
+    # StripChat/doppiocdn), so a VPN rotation invalidates the in-flight token and
+    # the capture CANNOT ride through -- it must restart to fetch a fresh token on
+    # the new IP. The LiveManager restarts these recordings the instant a rotation
+    # completes (fast recovery) instead of waiting ~60s for the stall watchdog.
+    # Sites whose segments are NOT IP-bound (e.g. Chaturbate) leave this False and
+    # ride through the rotation gap on the same file.
+    tokens_ip_bound: bool = False
     url: str = "javascript:void(0)"
     recording: bool = False
     sleep_on_private: int = 5
