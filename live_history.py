@@ -71,6 +71,7 @@ class LiveHistory:
         # (len, last_ts) key changes) and by a short TTL for the few
         # wall-clock-relative fields. key -> (n, last_ts, mono_ts, result).
         self._snap_cache: Dict[str, tuple] = {}
+        self._last_flush = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -136,7 +137,17 @@ class LiveHistory:
             if meta:
                 entry["meta"].update({k: v for k, v in meta.items() if v not in (None, "")})
             self._last_status[key] = status
-        self._flush()
+        # Throttle disk flushes. get_snapshot() calls record() per model on
+        # every poll; during a status storm (boot, when 1000+ models transition
+        # NOTRUNNING->online at once) an fsync of the whole JSON per transition
+        # serialized get_snapshot into a >45s /api/live/status timeout. Flush at
+        # most ~every 2s -- the in-memory log stays current, only the on-disk
+        # copy lags briefly (fine for a history sidecar).
+        import time as _t
+        now = _t.monotonic()
+        if now - self._last_flush >= 2.0:
+            self._last_flush = now
+            self._flush()
 
     def _update_meta_locked(self, key: str, meta: Dict[str, Any]) -> None:
         entry = self._data["models"].setdefault(key, {"transitions": [], "meta": {}})
