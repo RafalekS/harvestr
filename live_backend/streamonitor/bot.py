@@ -760,6 +760,16 @@ class Bot(Thread):
                     if self.sc != self.previous_status:
                         self.log(self.status())
                         self.previous_status = self.sc
+                    # Feed the VPN auto-rotator: a rate-limited exit IP (HTTP
+                    # 429 / Cloudflare 403 -> Status.RATELIMIT) is the signal to
+                    # rotate the Mullvad location and retry on a fresh IP. No-op
+                    # unless rotation is configured (vpn_config.json / env).
+                    if self.sc == Status.RATELIMIT:
+                        try:
+                            from streamonitor.utils import vpn_rotator as _vpn
+                            _vpn.report_ratelimit(self.siteslug or self.site or "?")
+                        except Exception:
+                            pass
                     if self.sc == Status.ERROR:
                         self._sleep(self.sleep_on_error)
                     if self.sc == Status.OFFLINE:

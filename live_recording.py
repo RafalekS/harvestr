@@ -383,6 +383,10 @@ class LiveManager:
         # One-shot background sweep to run the folder scans deferred during
         # _restore() above, without blocking boot.
         self._scan_sweeper = self._start_scan_sweeper()
+        # Optional Mullvad VPN auto-rotation: rotate the exit IP on a rate-limit
+        # storm, then wake the affected bots. No-op unless configured
+        # (vpn_config.json / STRMNTR_VPN_ROTATE) -- see VPN_SETUP.md.
+        self._vpn_watchdog = self._start_vpn_watchdog()
 
     def _start_scan_sweeper(self):
         """One-shot daemon that runs each bot's deferred folder scan
@@ -427,6 +431,62 @@ class LiveManager:
                              daemon=True)
         t.start()
         return t
+
+    def _start_vpn_watchdog(self):
+        """Watch for a rate-limit storm (a flagged exit IP) and rotate the
+        Mullvad location, then wake the affected site's bots so they retry on the
+        fresh IP. No-op unless rotation is configured (vpn_config.json / env)."""
+        try:
+            from streamonitor.utils import vpn_rotator as _vpn
+        except Exception:
+            return None
+        if not _vpn.configured():
+            log.info("[live] VPN auto-rotation: not configured (no-op)")
+            return None
+        import time as _time
+        try:
+            cfg_locs = _vpn._load_cfg().get("rotate_locations", [])
+        except Exception:
+            cfg_locs = []
+        log.info(f"[live] VPN auto-rotation armed: locations={cfg_locs}")
+
+        def _loop() -> None:
+            while True:
+                _time.sleep(20)
+                try:
+                    for slug in ("CB", "SC", "CS"):
+                        if _vpn.should_rotate(slug):
+                            loc = _vpn.rotate(reason=f"{slug} rate-limited",
+                                              log=lambda m: log.warning(m))
+                            if loc:
+                                self._wake_site_bots(slug)
+                            break  # at most one rotation per watchdog cycle
+                except Exception as e:
+                    log.debug(f"[live] vpn watchdog: {type(e).__name__}: {e}")
+
+        t = threading.Thread(target=_loop, name="live-vpn-watchdog", daemon=True)
+        t.start()
+        return t
+
+    def _wake_site_bots(self, site_slug: str) -> None:
+        """After a VPN rotation, clear the ratelimit backoff and wake the given
+        site's bots so they immediately re-poll on the new exit IP."""
+        try:
+            with self._lock:
+                bots = [rm.bot for rm in self._models.values()
+                        if getattr(rm.bot, "siteslug", "") == site_slug]
+            for bot in bots:
+                try:
+                    bot.ratelimit = False
+                    bot._offline_time = 0
+                    ev = getattr(bot, "_wake_event", None)
+                    if ev is not None:
+                        ev.set()
+                except Exception:
+                    pass
+            log.info(f"[live] woke {len(bots)} [{site_slug}] bots after VPN rotation")
+        except Exception as e:
+            log.debug(f"[live] wake bots: {e}")
 
     def _start_bulk_poller(self):
         """Start a daemon thread that calls each bulk-capable site's

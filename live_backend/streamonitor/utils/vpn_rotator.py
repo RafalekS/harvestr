@@ -1,0 +1,199 @@
+# streamonitor/utils/vpn_rotator.py
+# Optional Mullvad VPN auto-rotation on rate-limit.
+#
+# When a site (e.g. Chaturbate) rate-limits the current exit IP -- HTTP 429 /
+# Cloudflare "Just a moment" 403 / repeated RATELIMIT status -- this rotates the
+# Mullvad exit to the NEXT configured location and wakes the affected bots so
+# they retry on a fresh IP. It pairs with the per-site residential proxy
+# (proxy_pool / site_proxies.json): the proxy gives a stable clean IP, and VPN
+# rotation is the fallback for when an exit (proxy OR Mullvad) gets rate-limited.
+#
+# NOTHING here is hard-coded to one machine. All configuration is optional:
+#   * the `mullvad` CLI is AUTO-DETECTED (PATH, then common install dirs);
+#     override with the MULLVAD_CLI env var or vpn_config.json "cli_path".
+#   * rotation is DISABLED until you give it a list of locations, via either
+#     vpn_config.json (gitignored -- copy vpn_config.example.json) or the
+#     STRMNTR_VPN_ROTATE env var (comma-separated mullvad location codes, e.g.
+#     "nl,se,de,gb,us-nyc").
+#   * thresholds / cooldown are configurable with sane defaults.
+# When unconfigured or the CLI is missing, EVERY function is a safe no-op, so the
+# whole feature carries no regression risk for users who don't set it up.
+
+import os
+import json
+import time
+import shutil
+import subprocess
+import threading
+from pathlib import Path
+from collections import deque
+from typing import Optional, List, Dict, Callable
+
+_lock = threading.Lock()
+_cfg: Optional[dict] = None
+_cli: Optional[str] = None          # "" = looked, not found; None = not looked
+_rotate_idx = 0
+_last_rotate = 0.0
+_events: Dict[str, deque] = {}
+
+_DEFAULTS = {
+    "enabled": True,
+    "cli_path": None,                # auto-detect when null
+    "rotate_locations": [],          # e.g. ["nl", "se", "de", "gb"] -- empty = disabled
+    "ratelimit_threshold": 30,       # rate-limit events within the window to trigger
+    "ratelimit_window_sec": 120,
+    "rotate_cooldown_sec": 300,      # min seconds between rotations
+    "connect_wait_sec": 40,          # wait for "Connected" after a rotation
+}
+
+
+def _project_root() -> Path:
+    # vpn_rotator.py -> utils -> streamonitor -> live_backend -> <project root>
+    return Path(__file__).resolve().parents[3]
+
+
+def _load_cfg() -> dict:
+    global _cfg
+    if _cfg is not None:
+        return _cfg
+    with _lock:
+        if _cfg is not None:
+            return _cfg
+        cfg = dict(_DEFAULTS)
+        try:
+            f = _project_root() / "vpn_config.json"
+            if f.exists():
+                data = json.loads(f.read_text(encoding="utf-8"))
+                if isinstance(data, dict):
+                    cfg.update(data)
+        except Exception:
+            pass
+        # env overrides (take precedence over the file)
+        env = os.environ.get("STRMNTR_VPN_ROTATE", "")
+        if env.strip():
+            cfg["rotate_locations"] = [x.strip() for x in env.split(",") if x.strip()]
+        for key, var in (("ratelimit_threshold", "STRMNTR_VPN_RL_THRESHOLD"),
+                         ("rotate_cooldown_sec", "STRMNTR_VPN_COOLDOWN")):
+            v = os.environ.get(var)
+            if v:
+                try:
+                    cfg[key] = int(v)
+                except Exception:
+                    pass
+        if not isinstance(cfg.get("rotate_locations"), list):
+            cfg["rotate_locations"] = []
+        _cfg = cfg
+        return cfg
+
+
+def _find_cli() -> Optional[str]:
+    global _cli
+    if _cli is not None:
+        return _cli or None
+    cfg = _load_cfg()
+    cands: List[str] = []
+    if cfg.get("cli_path"):
+        cands.append(str(cfg["cli_path"]))
+    if os.environ.get("MULLVAD_CLI"):
+        cands.append(os.environ["MULLVAD_CLI"])
+    w = shutil.which("mullvad")
+    if w:
+        cands.append(w)
+    cands += [
+        r"C:\Program Files\Mullvad VPN\resources\mullvad.exe",
+        "/usr/bin/mullvad", "/usr/local/bin/mullvad", "/opt/homebrew/bin/mullvad",
+    ]
+    for c in cands:
+        try:
+            if c and os.path.exists(c):
+                _cli = c
+                return c
+        except Exception:
+            pass
+    _cli = ""  # cache the "not found" result
+    return None
+
+
+def configured() -> bool:
+    """Rotation is set up: enabled, has locations, and the CLI is present."""
+    cfg = _load_cfg()
+    return bool(cfg.get("enabled") and cfg.get("rotate_locations") and _find_cli())
+
+
+def _run(args: List[str], timeout: int = 30):
+    cli = _find_cli()
+    if not cli:
+        return None
+    try:
+        return subprocess.run([cli, *args], capture_output=True, text=True, timeout=timeout)
+    except Exception:
+        return None
+
+
+def status_text() -> str:
+    r = _run(["status"])
+    return (r.stdout or "").strip() if r else ""
+
+
+def report_ratelimit(site: str) -> None:
+    """A bot calls this when its status poll is rate-limited (RATELIMIT/429/403).
+    Cheap no-op unless rotation is configured."""
+    if not configured():
+        return
+    now = time.monotonic()
+    win = _load_cfg()["ratelimit_window_sec"]
+    with _lock:
+        dq = _events.setdefault(site, deque())
+        dq.append(now)
+        while dq and now - dq[0] > win:
+            dq.popleft()
+
+
+def should_rotate(site: str) -> bool:
+    if not configured():
+        return False
+    cfg = _load_cfg()
+    now = time.monotonic()
+    with _lock:
+        if now - _last_rotate < cfg["rotate_cooldown_sec"]:
+            return False
+        dq = _events.get(site)
+        if not dq:
+            return False
+        win = cfg["ratelimit_window_sec"]
+        while dq and now - dq[0] > win:
+            dq.popleft()
+        return len(dq) >= cfg["ratelimit_threshold"]
+
+
+def rotate(reason: str = "", log: Optional[Callable[[str], None]] = None) -> Optional[str]:
+    """Switch to the NEXT configured Mullvad location and reconnect. Returns the
+    new location code, or None if unavailable/failed."""
+    global _rotate_idx, _last_rotate
+    if not configured():
+        return None
+    cfg = _load_cfg()
+    locs = cfg["rotate_locations"]
+    with _lock:
+        loc = locs[_rotate_idx % len(locs)]
+        _rotate_idx += 1
+        _last_rotate = time.monotonic()
+        _events.clear()
+    # location may be "nl" or "nl ams" (country [city [host]])
+    parts = str(loc).split()
+    _run(["relay", "set", "location", *parts], timeout=30)
+    _run(["connect"], timeout=15)
+    deadline = time.time() + int(cfg.get("connect_wait_sec", 40))
+    new_ok = False
+    while time.time() < deadline:
+        if "Connected" in status_text():
+            new_ok = True
+            break
+        time.sleep(2)
+    if log:
+        try:
+            log(f"[vpn] rotated Mullvad exit -> '{loc}' "
+                f"({'connected' if new_ok else 'reconnecting'}){' :: ' + reason if reason else ''}")
+        except Exception:
+            pass
+    return loc

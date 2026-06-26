@@ -164,6 +164,14 @@ class Chaturbate(Bot):
             status = Status.ERROR
 
         self.ratelimit = status == Status.RATELIMIT
+        if self.ratelimit:
+            # Feed the VPN auto-rotator (no-op unless configured): catches the
+            # getVideoUrl path too, not just the run loop's self-poll.
+            try:
+                from streamonitor.utils import vpn_rotator as _vpn
+                _vpn.report_ratelimit(self.siteslug)
+            except Exception:
+                pass
         return status
 
     @staticmethod

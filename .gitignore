@@ -34,6 +34,8 @@ config.json.*
 # Proxy config (contains credentials — never commit)
 site_proxies.json
 proxies.txt
+# VPN auto-rotation config (machine-local; the .example template stays committed)
+vpn_config.json
 # Streamonitor's vendored config (live model list — usernames/room_ids)
 live_backend/config.json
 live_backend/config.json.*
