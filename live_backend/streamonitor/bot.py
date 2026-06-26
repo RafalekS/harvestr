@@ -212,6 +212,13 @@ class Bot(Thread):
         self.getVideo: Callable = getVideoFfmpeg
         self.stopDownload: Optional[Callable[[], None]] = None
         self.recording: bool = False
+        # Consecutive failed record cycles (no stream URL, or a recording that
+        # produced no data). Most single failures are the model leaving public
+        # between the status poll and the fetch (offline/private) or a transient
+        # CDN/DNS blip -- those self-heal on the next poll, so we DON'T flap the
+        # card to ERROR or log at ERROR for them; we only escalate after several
+        # in a row (a genuinely stuck-online model). Reset on any successful record.
+        self._consec_dl_fail: int = 0
         self.video_files: List[VideoData] = []
         self.video_files_total_size: int = 0
         # Guards the (list, size) rebind in cache_file_list so concurrent
@@ -768,6 +775,11 @@ class Bot(Thread):
                     if self.sc != self.previous_status:
                         self.log(self.status())
                         self.previous_status = self.sc
+                    # A model that's no longer PUBLIC (left / went private / offline)
+                    # clears the consecutive-failure tally so it returns fresh and a
+                    # later single blip doesn't immediately trip the ERROR escalation.
+                    if self.sc != Status.PUBLIC:
+                        self._consec_dl_fail = 0
                     # Feed the VPN auto-rotator: a rate-limited exit IP (HTTP
                     # 429 / Cloudflare 403 -> Status.RATELIMIT) is the signal to
                     # rotate the Mullvad location and retry on a fresh IP. No-op
@@ -802,12 +814,23 @@ class Bot(Thread):
                             try:
                                 video_url = self.getVideoUrl()
                             except Exception as e:
-                                self.logger.exception(e)
-                                self.logger.error('Failed to get video url')
+                                self.logger.debug(f'getVideoUrl failed (transient?): {e}')
                                 video_url = None
-                            if video_url is None:
-                                self.sc = Status.ERROR
-                                self.logger.error(self.status())
+                            if not video_url:
+                                # No stream right now -- almost always the model
+                                # just left public between the poll and this fetch,
+                                # or a transient CDN/DNS blip that self-heals. Don't
+                                # flap to ERROR / log ERROR for that; only escalate
+                                # after several CONSECUTIVE failures. (`not video_url`
+                                # also catches the [] some sites return.)
+                                self._consec_dl_fail += 1
+                                if self._consec_dl_fail >= 3:
+                                    self.sc = Status.ERROR
+                                    self.logger.warning(self.status())
+                                else:
+                                    self.logger.debug(
+                                        f'No stream URL (likely left public); re-polling '
+                                        f'[{self._consec_dl_fail}/3]')
                                 self._sleep(self.sleep_on_error)
                                 continue
                             self.log('Started downloading show')
@@ -820,12 +843,23 @@ class Bot(Thread):
                                 ret = False
                             if not ret:
                                 self.recording = False
-                                self.log('Recording ended with error')
-                                self.sc = Status.ERROR
-                                self.log(self.status())
+                                # A recording that ended with no data is usually the
+                                # model leaving / a transient CDN drop -- same
+                                # consecutive-failure gate as the no-URL case so the
+                                # card doesn't flap red on every blip.
+                                self._consec_dl_fail += 1
+                                if self._consec_dl_fail >= 3:
+                                    self.sc = Status.ERROR
+                                    self.log('Recording ended with error')
+                                    self.log(self.status())
+                                else:
+                                    self.logger.debug(
+                                        f'Recording ended early (transient); re-polling '
+                                        f'[{self._consec_dl_fail}/3]')
                                 self._sleep(self.sleep_on_error)
                                 continue
                             self.recording = False
+                            self._consec_dl_fail = 0
                             self.log('Recording ended')
                             try:
                                 self.cache_file_list()
@@ -898,7 +932,10 @@ class Bot(Thread):
                     )
                     
                     if result.status_code != 200:
-                        self.logger.error(f"Failed to fetch playlist: HTTP {result.status_code}")
+                        # Transient most of the time (model left -> 404, private ->
+                        # 403). The run loop's consecutive-failure gate escalates a
+                        # genuinely-stuck model, so keep this off ERROR.
+                        self.logger.warning(f"Failed to fetch playlist: HTTP {result.status_code}")
                         return None
                     
                     m3u8_doc = result.text
@@ -939,7 +976,9 @@ class Bot(Thread):
         try:
             sources = self.getPlaylistVariants(url)
             if not sources:
-                self.logger.error("No available sources")
+                # Usually the model just left public / a transient CDN blip; the
+                # run loop gates ERROR on consecutive failures, so this is debug.
+                self.logger.debug("No available sources (model likely left public)")
                 return None
 
             for source in sources:

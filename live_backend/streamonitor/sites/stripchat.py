@@ -1279,7 +1279,11 @@ class StripChat(RoomIdBot):
                 result = None
         
         if not result or result.status_code != 200:
-            self.logger.error(f"Failed to fetch playlist from any CDN host")
+            # Almost always the model left public between the status poll and this
+            # fetch (master 404s on every host) or a private show (403) or a
+            # transient doppiocdn DNS blip. The run loop escalates to ERROR only
+            # after consecutive failures, so this stays a WARNING, not an ERROR.
+            self.logger.warning("Failed to fetch playlist from any CDN host (model likely left / private)")
             return []
             
         m3u8_doc = result.text
@@ -1297,7 +1301,7 @@ class StripChat(RoomIdBot):
         self.debug(f"Parsed {len(variants) if variants else 0} variants from playlist")
         
         if not variants:
-            self.logger.error("No variants found in playlist")
+            self.logger.debug("No variants found in playlist (transient)")
             return []
         
         # Add authentication keys to variant URLs and rewrite to use direct CDN
