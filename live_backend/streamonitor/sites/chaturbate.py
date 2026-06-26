@@ -3,6 +3,7 @@ import requests
 from typing import Optional, Set
 from streamonitor.bot import Bot
 from streamonitor.enums import Status, Gender
+from streamonitor.downloaders.hls import getVideoNativeHLS
 
 
 class Chaturbate(Bot):
@@ -24,6 +25,13 @@ class Chaturbate(Bot):
         self.sleep_on_error = 60
         self._max_consecutive_errors = 50  # Chaturbate can be flaky, allow more retries
         self.url = self.getWebsiteURL()
+        # CB's edge CDN now fingerprints the HTTP client and returns 403 on the
+        # chunklist/segments to ffmpeg's native HTTP (browser-like clients pass).
+        # Route capture through the native HLS downloader: it fetches the
+        # playlist + segments with python-requests (which the edge allows) and
+        # feeds ffmpeg LOCALLY, bypassing the ffmpeg-HTTP block. Verified live:
+        # 2 MB in 16s via this path where direct ffmpeg got 0 bytes / HTTP 403.
+        self.getVideo = getVideoNativeHLS
     
     def get_site_color(self):
         """Return the color scheme for this site"""
