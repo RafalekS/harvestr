@@ -43,6 +43,9 @@ DOWNLOADS_DIR = SCRIPT_DIR / "downloads"
 HISTORY_PATH = DOWNLOADS_DIR / "history.json"
 FAILED_PATH = DOWNLOADS_DIR / "failed.json"
 LOG_PATH = DOWNLOADS_DIR / "universal.log"
+# Network settings (both gitignored — hold proxy credentials / rotation config):
+SITE_PROXIES_PATH = SCRIPT_DIR / "site_proxies.json"
+VPN_CONFIG_PATH = SCRIPT_DIR / "vpn_config.json"
 
 app = Flask(__name__)
 
@@ -271,6 +274,71 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+# ── Network settings: per-site proxy + Mullvad VPN rotation ───────────────
+# Both files are gitignored. site_proxies.json holds proxy URLs WITH credentials;
+# vpn_config.json holds the rotation config. The webui reads/writes them so a
+# cloner can configure everything from the UI without editing the repo, and so
+# OUR working config stays local (never pushed).
+_VPN_DEFAULTS = {
+    "enabled": True, "cli_path": None,
+    "rotate_locations": ["nl", "se", "de", "gb", "ch", "us"],
+    "restart_threshold": 10, "rotate_threshold": 25,
+    "ratelimit_window_sec": 120, "restart_cooldown_sec": 60,
+    "rotate_cooldown_sec": 300, "connect_wait_sec": 40,
+}
+# site slug -> human label, for the UI dropdown
+NET_SITE_LABELS = {
+    "CB": "Chaturbate", "SC": "StripChat", "CS": "CamSoda", "SM": "Stripcaster",
+    "BC": "BongaCams", "C4": "Cam4", "XLC": "XLoveCam",
+}
+
+
+def load_site_proxies() -> dict:
+    d = load_json(SITE_PROXIES_PATH) or {}
+    return {str(k).upper(): str(v) for k, v in d.items() if v} if isinstance(d, dict) else {}
+
+
+def save_site_proxies(d: dict) -> None:
+    SITE_PROXIES_PATH.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def load_vpn_config() -> dict:
+    cfg = dict(_VPN_DEFAULTS)
+    data = load_json(VPN_CONFIG_PATH) or {}
+    if isinstance(data, dict):
+        cfg.update(data)
+    cfg.pop("_comment", None)
+    return cfg
+
+
+def save_vpn_config(d: dict) -> None:
+    VPN_CONFIG_PATH.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+
+
+def _mask_proxy(url: str) -> str:
+    """user:pass@host -> user:***@host so the password isn't shipped to the DOM."""
+    try:
+        import re as _re
+        return _re.sub(r"(://[^:/@]+:)([^@/]+)(@)", r"\1***\3", url or "")
+    except Exception:
+        return url or ""
+
+
+def _unmask_proxy(new_url: str, old_url: str) -> str:
+    """If the UI sent back a masked password (***), splice the stored one back in
+    so host/port edits survive without re-typing credentials."""
+    if "***" not in (new_url or ""):
+        return new_url
+    try:
+        import re as _re
+        m = _re.search(r"://[^:/@]+:([^@/]+)@", old_url or "")
+        if m:
+            return new_url.replace("***", m.group(1), 1)
+    except Exception:
+        pass
+    return new_url
 
 
 def load_json(path: Path) -> dict:
@@ -1876,6 +1944,12 @@ INDEX_HTML = r"""
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5v14M5 12h14"/></svg>
         Track a model
         <button class="ghost" style="margin-left:auto; padding:5px 10px; font-size:12px;"
+                onclick="openNetSettings()" data-tip="Proxy &amp; VPN rotation settings"
+                aria-label="Open network settings">
+          <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          Network
+        </button>
+        <button class="ghost" style="padding:5px 10px; font-size:12px;"
                 onclick="openLiveSettings()" data-tip="Live recording settings"
                 aria-label="Open live settings">
           <svg viewBox="0 0 24 24" width="13" height="13" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
@@ -2081,6 +2155,70 @@ INDEX_HTML = r"""
     <div class="livesettings-actions">
       <button class="ghost" onclick="closeLiveSettings()">Cancel</button>
       <button class="primary" onclick="saveLiveSettings()">Save live settings</button>
+    </div>
+  </div>
+</div>
+
+<!-- Network settings modal (per-site proxy + Mullvad VPN rotation) -->
+<div class="modal-backdrop" id="netsettings-modal" onclick="closeNetSettings(event)" role="dialog" aria-modal="true" aria-labelledby="netsettings-title">
+  <div class="modal-card livesettings-card" onclick="event.stopPropagation()">
+    <div class="livesettings-head">
+      <div>
+        <h3 id="netsettings-title">
+          <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+          Network · Proxy &amp; VPN
+        </h3>
+        <p class="muted">Pin high-volume sites to a residential proxy, and/or auto-rotate Mullvad on rate-limit. Saved locally only — never pushed.</p>
+      </div>
+      <button class="xs ghost" onclick="closeNetSettings()" aria-label="Close">✕</button>
+    </div>
+
+    <div class="livesettings-body">
+      <div class="ls-section">
+        <div class="ls-section-title">Per-site residential proxy</div>
+        <p class="muted" style="font-size:12px; margin:0 0 8px;">Route one site through a dedicated exit IP. Format <code>http://user:pass@host:port</code>. Applies to newly added / restarted bots.</p>
+        <div id="net-proxy-rows"></div>
+        <button class="ghost xs" onclick="addProxyRow()" style="margin-top:6px;">+ Add site proxy</button>
+      </div>
+
+      <div class="ls-section">
+        <div class="ls-section-title">Mullvad VPN auto-rotation</div>
+        <div class="ls-row">
+          <label for="net-vpn-enabled">Enabled</label>
+          <input id="net-vpn-enabled" type="checkbox"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-locations">Locations <span class="muted">(comma-sep Mullvad codes; empty = off)</span></label>
+          <input id="net-vpn-locations" type="text" placeholder="nl, se, de, gb, ch, us"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-restart-thr">Tier 1 — restart bots after N rate-limits</label>
+          <input id="net-vpn-restart-thr" type="number" min="1" placeholder="10"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-rotate-thr">Tier 2 — rotate VPN after N rate-limits</label>
+          <input id="net-vpn-rotate-thr" type="number" min="1" placeholder="25"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-window">Rate-limit window (sec)</label>
+          <input id="net-vpn-window" type="number" min="10" placeholder="120"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-restart-cd">Restart cooldown (sec)</label>
+          <input id="net-vpn-restart-cd" type="number" min="0" placeholder="60"/>
+        </div>
+        <div class="ls-row">
+          <label for="net-vpn-rotate-cd">Rotate cooldown (sec)</label>
+          <input id="net-vpn-rotate-cd" type="number" min="0" placeholder="300"/>
+        </div>
+        <p class="muted" id="net-vpn-clistatus" style="font-size:12px; margin:6px 0 0;"></p>
+      </div>
+    </div>
+
+    <div class="livesettings-actions">
+      <button class="ghost" onclick="resetNetSettings()" style="margin-right:auto;" data-tip="Reset all fields to the shipped defaults">Reset to defaults</button>
+      <button class="ghost" onclick="closeNetSettings()">Cancel</button>
+      <button class="primary" onclick="saveNetSettings()">Save network settings</button>
     </div>
   </div>
 </div>
@@ -2521,6 +2659,108 @@ async function saveLiveSettings() {
   } else {
     try { toast('Error: ' + errMsg, 'error'); } catch(_) {}
   }
+}
+
+// ── Network settings modal (per-site proxy + Mullvad VPN rotation) ─────
+let _netDefaults = null;
+let _netSiteLabels = {CB:'Chaturbate',SC:'StripChat',CS:'CamSoda',SM:'Stripcaster',BC:'BongaCams',C4:'Cam4',XLC:'XLoveCam'};
+
+async function openNetSettings() {
+  let data = null, err = '';
+  try {
+    const r = await fetch('/api/live/netconfig');
+    if (r.ok) data = await r.json(); else err = 'HTTP ' + r.status;
+  } catch (e) { err = (e && e.message) || String(e); }
+  if (!data) { try { toast('Could not load network settings: ' + err, 'error'); } catch(_){} return; }
+  _netDefaults = data.defaults || {vpn:{}, site_proxies:{}};
+  if (data.site_labels && Object.keys(data.site_labels).length) _netSiteLabels = data.site_labels;
+  _netFill(data.site_proxies || {}, data.vpn || {});
+  const cs = document.getElementById('net-vpn-clistatus');
+  if (cs) {
+    cs.textContent = data.vpn_configured
+      ? ('✓ Mullvad detected · ' + (data.vpn_status || 'ready'))
+      : 'Mullvad CLI not detected or no locations set — rotation is off (no-op). See VPN_SETUP.md.';
+  }
+  document.getElementById('netsettings-modal').classList.add('show');
+}
+function closeNetSettings(e) {
+  if (e && e.target && e.target.id !== 'netsettings-modal') return;
+  document.getElementById('netsettings-modal').classList.remove('show');
+}
+function _netFill(proxies, vpn) {
+  const wrap = document.getElementById('net-proxy-rows');
+  wrap.innerHTML = '';
+  const entries = Object.entries(proxies || {});
+  if (!entries.length) addProxyRow();
+  else entries.forEach(([slug, url]) => addProxyRow(slug, url));
+  const g = (id) => document.getElementById(id);
+  g('net-vpn-enabled').checked = !!(vpn.enabled ?? true);
+  const locs = vpn.rotate_locations;
+  g('net-vpn-locations').value = Array.isArray(locs) ? locs.join(', ') : (locs || '');
+  g('net-vpn-restart-thr').value = vpn.restart_threshold ?? '';
+  g('net-vpn-rotate-thr').value  = vpn.rotate_threshold ?? '';
+  g('net-vpn-window').value      = vpn.ratelimit_window_sec ?? '';
+  g('net-vpn-restart-cd').value  = vpn.restart_cooldown_sec ?? '';
+  g('net-vpn-rotate-cd').value   = vpn.rotate_cooldown_sec ?? '';
+}
+function addProxyRow(slug, url) {
+  const wrap = document.getElementById('net-proxy-rows');
+  const row = document.createElement('div');
+  row.className = 'net-proxy-row';
+  row.style.cssText = 'display:flex; gap:6px; margin-bottom:6px; align-items:center;';
+  let opts = '';
+  Object.entries(_netSiteLabels).forEach(([k, label]) => {
+    opts += '<option value="' + k + '"' + (k === slug ? ' selected' : '') + '>' + escapeHtml(label) + ' (' + k + ')</option>';
+  });
+  row.innerHTML =
+    '<select class="net-proxy-site" style="flex:0 0 160px;">' + opts + '</select>'
+    + '<input class="net-proxy-url" type="text" placeholder="http://user:pass@host:port" value="' + escapeHtml(url || '') + '" style="flex:1;"/>'
+    + '<button class="ghost xs" onclick="this.parentNode.remove()" aria-label="Remove proxy" title="Remove">✕</button>';
+  wrap.appendChild(row);
+}
+function _netCollect() {
+  const proxies = {};
+  document.querySelectorAll('#net-proxy-rows .net-proxy-row').forEach(row => {
+    const slug = row.querySelector('.net-proxy-site').value;
+    const url = row.querySelector('.net-proxy-url').value.trim();
+    if (slug && url) proxies[slug] = url;
+  });
+  const g = (id) => document.getElementById(id);
+  return {
+    site_proxies: proxies,
+    vpn: {
+      enabled: !!g('net-vpn-enabled').checked,
+      rotate_locations: g('net-vpn-locations').value,
+      restart_threshold:   parseInt(g('net-vpn-restart-thr').value) || 10,
+      rotate_threshold:    parseInt(g('net-vpn-rotate-thr').value)  || 25,
+      ratelimit_window_sec:parseInt(g('net-vpn-window').value)      || 120,
+      restart_cooldown_sec:parseInt(g('net-vpn-restart-cd').value)  || 60,
+      rotate_cooldown_sec: parseInt(g('net-vpn-rotate-cd').value)   || 300,
+    },
+  };
+}
+async function saveNetSettings() {
+  const payload = _netCollect();
+  let ok = false, err = '';
+  try {
+    const r = await fetch('/api/live/netconfig', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(payload),
+    });
+    ok = r.ok;
+    if (!r.ok) err = 'HTTP ' + r.status + ' ' + r.statusText;
+  } catch (e) { err = (e && e.message) || String(e); }
+  if (ok) {
+    try { toast('Network settings saved · VPN applied live, proxy on next (re)start', 'success'); } catch(_){}
+    try { closeNetSettings(); } catch(_){}
+  } else {
+    try { toast('Error: ' + err, 'error'); } catch(_){}
+  }
+}
+function resetNetSettings() {
+  const d = _netDefaults || {vpn:{}, site_proxies:{}};
+  _netFill(d.site_proxies || {}, d.vpn || {});
+  try { toast('Reset to defaults — click Save to apply', 'info'); } catch(_){}
 }
 
 // ── History reset (danger zone) ───────────────────────────────────────
@@ -4362,6 +4602,88 @@ def api_config():
         save_config(cur)
         return jsonify({"ok": True})
     return jsonify(load_config())
+
+
+@app.route("/api/live/netconfig", methods=["GET", "POST"])
+def api_live_netconfig():
+    """Per-site residential proxy + Mullvad VPN rotation config.
+
+    GET  -> current config (proxy passwords masked) + defaults + Mullvad status.
+    POST -> {site_proxies:{SLUG:url}, vpn:{...}} -> writes both gitignored files
+            and hot-reloads the rotator + proxy pool (VPN applies live; proxy
+            applies to newly added / restarted bots)."""
+    if request.method == "POST":
+        body = request.get_json(force=True) or {}
+        # --- per-site proxies ---
+        cur_proxies = load_site_proxies()
+        out_proxies = {}
+        try:
+            for slug, url in (body.get("site_proxies") or {}).items():
+                slug = str(slug).upper().strip()
+                url = (url or "").strip()
+                if not slug or not url:
+                    continue
+                out_proxies[slug] = _unmask_proxy(url, cur_proxies.get(slug, ""))
+            save_site_proxies(out_proxies)
+        except Exception as e:
+            return jsonify({"error": f"bad proxies: {e}"}), 400
+        # --- vpn rotation ---
+        vpn_in = body.get("vpn") or {}
+        cur_vpn = load_vpn_config()
+        try:
+            locs = vpn_in.get("rotate_locations")
+            if isinstance(locs, str):
+                locs = [x.strip() for x in locs.split(",") if x.strip()]
+            if not isinstance(locs, list):
+                locs = cur_vpn.get("rotate_locations", [])
+            cur_vpn.update({
+                "enabled": bool(vpn_in.get("enabled", cur_vpn.get("enabled", True))),
+                "rotate_locations": locs,
+                "restart_threshold": int(vpn_in.get("restart_threshold", cur_vpn["restart_threshold"])),
+                "rotate_threshold": int(vpn_in.get("rotate_threshold", cur_vpn["rotate_threshold"])),
+                "ratelimit_window_sec": int(vpn_in.get("ratelimit_window_sec", cur_vpn["ratelimit_window_sec"])),
+                "restart_cooldown_sec": int(vpn_in.get("restart_cooldown_sec", cur_vpn["restart_cooldown_sec"])),
+                "rotate_cooldown_sec": int(vpn_in.get("rotate_cooldown_sec", cur_vpn["rotate_cooldown_sec"])),
+            })
+            if "cli_path" in vpn_in:
+                cur_vpn["cli_path"] = vpn_in.get("cli_path") or None
+            save_vpn_config(cur_vpn)
+        except Exception as e:
+            return jsonify({"error": f"bad vpn config: {e}"}), 400
+        # --- hot-reload both subsystems ---
+        applied = {"vpn_reloaded": False, "proxy_reloaded": False}
+        try:
+            from streamonitor.utils import vpn_rotator as _vpn
+            _vpn.reload(); applied["vpn_reloaded"] = True
+        except Exception:
+            pass
+        try:
+            from streamonitor.utils import proxy_pool as _pp
+            _pp.reload(); applied["proxy_reloaded"] = True
+        except Exception:
+            pass
+        return jsonify({"ok": True, "applied": applied})
+
+    # GET
+    masked = {k: _mask_proxy(v) for k, v in load_site_proxies().items()}
+    vpn = load_vpn_config()
+    configured, vpn_status = False, ""
+    try:
+        from streamonitor.utils import vpn_rotator as _vpn
+        configured = bool(_vpn.configured())
+        if configured:
+            st = (_vpn.status_text() or "").splitlines()
+            vpn_status = st[0] if st else ""
+    except Exception:
+        pass
+    return jsonify({
+        "site_proxies": masked,
+        "vpn": vpn,
+        "defaults": {"site_proxies": {}, "vpn": _VPN_DEFAULTS},
+        "site_labels": NET_SITE_LABELS,
+        "vpn_configured": configured,
+        "vpn_status": vpn_status,
+    })
 
 
 @app.route("/api/config/performer/add", methods=["POST"])

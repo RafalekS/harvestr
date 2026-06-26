@@ -154,3 +154,16 @@ def proxies_dict(key: Optional[str] = None) -> Optional[Dict[str, str]]:
     if not p:
         return None
     return {"http": p, "https": p}
+
+
+def reload() -> None:
+    """Drop the cached pool + per-site overrides so the next get_proxy() re-reads
+    proxies.txt / site_proxies.json / env. Lets the webui apply a site_proxies
+    change without a full restart: newly added or restarted bots pick up the new
+    exit. Bots already mid-recording keep their current IP-bound session (sticky
+    map is preserved) until they cycle."""
+    global _proxies, _rr, _site_proxies
+    with _lock:
+        _proxies = None
+        _rr = None
+        _site_proxies = None

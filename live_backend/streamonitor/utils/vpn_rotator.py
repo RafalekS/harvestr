@@ -90,6 +90,16 @@ def _load_cfg() -> dict:
         return cfg
 
 
+def reload() -> None:
+    """Drop the cached config + CLI path so the next call re-reads
+    vpn_config.json / env. Lets the webui apply rotation-setting changes live,
+    no restart needed."""
+    global _cfg, _cli
+    with _lock:
+        _cfg = None
+        _cli = None
+
+
 def _find_cli() -> Optional[str]:
     global _cli
     if _cli is not None:
