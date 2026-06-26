@@ -95,6 +95,31 @@ copy, set `HARVESTR_STREAMONITOR=<path>` before launching `webui.py`.
 - Bulk start/stop all
 - Command palette (`Ctrl+K`) for quick actions across both tabs
 
+**Scaling to 1000+ models — exit-IP rotation & proxy:**
+
+At scale a single exit IP gets Cloudflare-flagged / rate-limited (Chaturbate is
+the worst offender at 600+ models). Harvestr ships two complementary, **opt-in**
+tools, configurable from a **Network** button in the Live tab (gear menu) or the
+gitignored config files:
+
+- **Mullvad VPN auto-rotation** — when a site rate-limits the current exit, a
+  *tiered* watchdog first **restarts** the affected bots on the same IP (most
+  limits are transient), and only **rotates** the Mullvad exit if it keeps
+  climbing. The Mullvad CLI is auto-detected; nothing is hard-coded to one
+  machine. There's a manual **Rotate exit now** button too.
+- **Per-site residential proxy** — pin one site to a dedicated exit IP,
+  independent of the VPN, for a site that needs a clean residential IP. (Note:
+  the limit is *concurrent connections*, not bandwidth — a 100-thread proxy
+  can't feed Chaturbate's 600+ models, so CB stays on Mullvad.)
+- **Rotation ride-through** — active recordings survive the rotation gap: sites
+  whose segments aren't IP-bound (Chaturbate) keep writing the **same file** on
+  the new IP; IP-bound sites (StripChat/doppiocdn) restart instantly for a fresh
+  token instead of stalling ~60 s.
+
+Both config files (`vpn_config.json`, `site_proxies.json`) are **gitignored**, so
+your credentials and working setup are never committed — the repo ships only
+`*.example.json` templates. Full guide: **[VPN_SETUP.md](VPN_SETUP.md)**.
+
 ---
 
 ## Supported sites (partial list)

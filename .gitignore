@@ -63,6 +63,10 @@ Thumbs.db
 .ruff_cache/
 *.log
 
+# Runtime log dirs (rotated logs like live-errors.log.2026-06-25 aren't caught by *.log)
+logs/
+live_backend/logs/
+
 # Embedded Tor runtime cache (tor_helper.py writes consensus/microdesc here)
 _tor_data/
 
