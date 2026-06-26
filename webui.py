@@ -2212,6 +2212,7 @@ INDEX_HTML = r"""
           <input id="net-vpn-rotate-cd" type="number" min="0" placeholder="300"/>
         </div>
         <p class="muted" id="net-vpn-clistatus" style="font-size:12px; margin:6px 0 0;"></p>
+        <button class="ghost xs" onclick="rotateNow()" style="margin-top:8px;" data-tip="Force-switch the Mullvad exit now; active recordings ride through the gap">Rotate exit now</button>
       </div>
     </div>
 
@@ -2761,6 +2762,20 @@ function resetNetSettings() {
   const d = _netDefaults || {vpn:{}, site_proxies:{}};
   _netFill(d.site_proxies || {}, d.vpn || {});
   try { toast('Reset to defaults — click Save to apply', 'info'); } catch(_){}
+}
+async function rotateNow() {
+  let proceed = true;
+  try { proceed = await confirmDialog('Rotate the Mullvad exit now? Active recordings ride through the ~10s gap (same file, no split).'); } catch(_) { proceed = true; }
+  if (!proceed) return;
+  let ok = false, err = '', resp = null;
+  try {
+    const r = await fetch('/api/live/netconfig/rotate', {method: 'POST'});
+    ok = r.ok;
+    try { resp = await r.json(); } catch(_){}
+    if (!r.ok) err = (resp && resp.error) || ('HTTP ' + r.status);
+  } catch (e) { err = (e && e.message) || String(e); }
+  if (ok) { try { toast('Rotating Mullvad exit… (~10–30s, recordings ride through)', 'info'); } catch(_){} }
+  else    { try { toast('Rotate failed: ' + err, 'error'); } catch(_){} }
 }
 
 // ── History reset (danger zone) ───────────────────────────────────────
@@ -4684,6 +4699,30 @@ def api_live_netconfig():
         "vpn_configured": configured,
         "vpn_status": vpn_status,
     })
+
+
+@app.route("/api/live/netconfig/rotate", methods=["POST"])
+def api_live_netconfig_rotate():
+    """Manually rotate the Mullvad exit now. Also exercises the ride-through
+    grace, so active recordings survive the disconnect/reconnect gap (same file).
+    Runs in a background thread (the rotate blocks ~10-40s); returns at once."""
+    try:
+        from streamonitor.utils import vpn_rotator as _vpn
+    except Exception as e:
+        return jsonify({"error": f"vpn_rotator unavailable: {e}"}), 500
+    if not _vpn.configured():
+        return jsonify({"error": "VPN rotation not configured (need Mullvad locations + the CLI)"}), 400
+    import threading as _th
+    import logging as _lg
+    _log = _lg.getLogger("webui")
+    def _do():
+        try:
+            loc = _vpn.rotate(reason="manual (UI)", log=lambda m: _log.warning(m))
+            _log.warning(f"[vpn] manual rotation complete -> {loc}")
+        except Exception as e:
+            _log.warning(f"[vpn] manual rotation failed: {e}")
+    _th.Thread(target=_do, name="vpn-manual-rotate", daemon=True).start()
+    return jsonify({"ok": True, "started": True})
 
 
 @app.route("/api/config/performer/add", methods=["POST"])
