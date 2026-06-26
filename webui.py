@@ -4878,6 +4878,7 @@ def api_live_sites():
 # bots (+ history + metadata) and pegged CPU under frequent / multi-tab polling;
 # a ~1.5 s TTL dedupes bursts with negligible staleness for a dashboard.
 _live_snap_cache = {"ts": 0.0, "data": None}
+_live_snap_lock = threading.Lock()
 
 
 def _live_snapshot_cached():
@@ -4886,10 +4887,19 @@ def _live_snapshot_cached():
     data = _live_snap_cache["data"]
     if data is not None and (now - _live_snap_cache["ts"]) < 1.5:
         return data
-    data = _live.get_snapshot()
-    _live_snap_cache["data"] = data
-    _live_snap_cache["ts"] = now
-    return data
+    # Serialize concurrent misses (double-checked): with several browser tabs /
+    # the 3s+12s poll split, a burst of requests would otherwise EACH rebuild the
+    # heavy 1000+ model snapshot at once. First thread computes; the rest wait
+    # here and return the fresh result.
+    with _live_snap_lock:
+        now = _t.monotonic()
+        data = _live_snap_cache["data"]
+        if data is not None and (now - _live_snap_cache["ts"]) < 1.5:
+            return data
+        data = _live.get_snapshot()
+        _live_snap_cache["data"] = data
+        _live_snap_cache["ts"] = now
+        return data
 
 
 @app.route("/api/live/status")

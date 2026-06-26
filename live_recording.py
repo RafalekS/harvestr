@@ -888,70 +888,77 @@ class LiveManager:
                 log.debug(f"[live] history init: {e}")
                 self._history = None
 
+        # Snapshot the model list under the lock, then build the per-model dicts
+        # OUTSIDE it. This loop does metadata extraction, history file-I/O and
+        # freq computation for 1000+ models; holding self._lock across all of it
+        # serialized every other lock user and starved the fast summary endpoint
+        # to 45s timeouts under browser polling. LiveHistory has its own lock and
+        # bot attributes are read live -- an eventually-consistent UI snapshot.
         with self._lock:
-            for _, rm in sorted(self._models.items(),
-                                key=lambda kv: (kv[1].site, kv[1].username.lower())):
-                bot = rm.bot
-                status_name = getattr(getattr(bot, "sc", None), "name", "UNKNOWN")
-                status_hist[status_name] = status_hist.get(status_name, 0) + 1
-                label, color = status_ui(status_name)
-                is_running = bool(getattr(bot, "running", False))
-                is_recording = bool(getattr(bot, "recording", False))
-                if is_recording:
-                    recording_count += 1
-                # Total file size for this model (StreaMonitor caches in
-                # video_files_total_size on the Bot)
-                size_bytes = int(getattr(bot, "video_files_total_size", 0) or 0)
-                total_sessions_bytes += size_bytes
+            items = sorted(self._models.items(),
+                           key=lambda kv: (kv[1].site, kv[1].username.lower()))
+        for _, rm in items:
+            bot = rm.bot
+            status_name = getattr(getattr(bot, "sc", None), "name", "UNKNOWN")
+            status_hist[status_name] = status_hist.get(status_name, 0) + 1
+            label, color = status_ui(status_name)
+            is_running = bool(getattr(bot, "running", False))
+            is_recording = bool(getattr(bot, "recording", False))
+            if is_recording:
+                recording_count += 1
+            # Total file size for this model (StreaMonitor caches in
+            # video_files_total_size on the Bot)
+            size_bytes = int(getattr(bot, "video_files_total_size", 0) or 0)
+            total_sessions_bytes += size_bytes
 
-                # Extract rich metadata from bot.lastInfo (StripChat etc.
-                # expose age, country, language, tags, stream_duration,
-                # follower/spectator count, avatar/thumbnail URLs, etc.)
-                last_info = getattr(bot, "lastInfo", {}) or {}
-                enriched = _extract_rich_meta(last_info)
+            # Extract rich metadata from bot.lastInfo (StripChat etc.
+            # expose age, country, language, tags, stream_duration,
+            # follower/spectator count, avatar/thumbnail URLs, etc.)
+            last_info = getattr(bot, "lastInfo", {}) or {}
+            enriched = _extract_rich_meta(last_info)
 
-                # Record state transition in history ledger (transition-only)
-                key = self.key_of(rm.username, rm.site)
-                if self._history:
-                    try:
-                        self._history.record(key, status_name, meta=enriched)
-                    except Exception as e:
-                        log.debug(f"[live] record {key}: {e}")
+            # Record state transition in history ledger (transition-only)
+            key = self.key_of(rm.username, rm.site)
+            if self._history:
+                try:
+                    self._history.record(key, status_name, meta=enriched)
+                except Exception as e:
+                    log.debug(f"[live] record {key}: {e}")
 
-                # Derived freq metrics
-                freq = self._history.snapshot(key) if self._history else {}
+            # Derived freq metrics
+            freq = self._history.snapshot(key) if self._history else {}
 
-                models.append({
-                    "key": key,
-                    "username": rm.username,
-                    "site": rm.site,
-                    "site_slug": getattr(bot, "siteslug", ""),
-                    "room_id": rm.room_id or "",
-                    "running": is_running,
-                    "recording": is_recording,
-                    "status": status_name,
-                    "status_label": label,
-                    "status_color": color,
-                    "size_bytes": size_bytes,
-                    "gender": getattr(getattr(bot, "gender", None), "value", "") or enriched.get("gender", ""),
-                    "country": getattr(bot, "country", "") or enriched.get("country", ""),
-                    "language": enriched.get("language", ""),
-                    "age": enriched.get("age"),
-                    "tags": enriched.get("tags", []),
-                    "avatar_url": enriched.get("avatar_url", ""),
-                    "thumb_url": enriched.get("thumb_url", ""),
-                    "spectators": enriched.get("spectators"),
-                    "followers": enriched.get("followers"),
-                    "stream_duration_s": enriched.get("stream_duration_s"),
-                    # Derived frequency metrics (from LiveHistory)
-                    "last_online_ts": freq.get("last_online_ts", ""),
-                    "last_offline_ts": freq.get("last_offline_ts", ""),
-                    "online_sessions_7d": freq.get("online_sessions_7d", 0),
-                    "online_hours_7d": freq.get("online_hours_7d", 0),
-                    "avg_session_minutes": freq.get("avg_session_minutes", 0),
-                    "next_predicted_ts": freq.get("next_predicted_ts", ""),
-                    "peak_hour_utc": freq.get("peak_hour_utc", -1),
-                })
+            models.append({
+                "key": key,
+                "username": rm.username,
+                "site": rm.site,
+                "site_slug": getattr(bot, "siteslug", ""),
+                "room_id": rm.room_id or "",
+                "running": is_running,
+                "recording": is_recording,
+                "status": status_name,
+                "status_label": label,
+                "status_color": color,
+                "size_bytes": size_bytes,
+                "gender": getattr(getattr(bot, "gender", None), "value", "") or enriched.get("gender", ""),
+                "country": getattr(bot, "country", "") or enriched.get("country", ""),
+                "language": enriched.get("language", ""),
+                "age": enriched.get("age"),
+                "tags": enriched.get("tags", []),
+                "avatar_url": enriched.get("avatar_url", ""),
+                "thumb_url": enriched.get("thumb_url", ""),
+                "spectators": enriched.get("spectators"),
+                "followers": enriched.get("followers"),
+                "stream_duration_s": enriched.get("stream_duration_s"),
+                # Derived frequency metrics (from LiveHistory)
+                "last_online_ts": freq.get("last_online_ts", ""),
+                "last_offline_ts": freq.get("last_offline_ts", ""),
+                "online_sessions_7d": freq.get("online_sessions_7d", 0),
+                "online_hours_7d": freq.get("online_hours_7d", 0),
+                "avg_session_minutes": freq.get("avg_session_minutes", 0),
+                "next_predicted_ts": freq.get("next_predicted_ts", ""),
+                "peak_hour_utc": freq.get("peak_hour_utc", -1),
+            })
 
         return {
             "available": available,
