@@ -357,6 +357,7 @@ class LiveManager:
         if Bot is not None:
             try:
                 Bot.defer_init_scan = True
+                Bot.suppress_boot_poll = True
             except Exception:
                 pass
         try:
@@ -365,6 +366,7 @@ class LiveManager:
             if Bot is not None:
                 try:
                     Bot.defer_init_scan = False
+                    Bot.suppress_boot_poll = False
                 except Exception:
                     pass
         # Spawn the bulk-status poller so bulk-update sites (Chaturbate,

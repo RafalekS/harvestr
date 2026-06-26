@@ -105,6 +105,14 @@ class Bot(Thread):
     # background sweeper runs the scans just after boot. Default False keeps the
     # native CLI path (and UI-created bots) scanning synchronously as before.
     defer_init_scan: bool = False
+    # When True (set by LiveManager ONLY during its startup restore), bulk-update
+    # bots do NOT self-poll getStatus at NOTRUNNING -- their startup status comes
+    # from the bulk poller, avoiding a 1000+ getStatus burst that stalled boot
+    # (port unreachable for minutes). Reset to False after restore so UI-ADDED
+    # bulk bots self-poll once to get their initial status promptly; the bulk
+    # poller can lag a freshly-added model, which left newly added CB/SC/CS
+    # models stuck NOTRUNNING (online but never recording).
+    suppress_boot_poll: bool = False
     ratelimit: bool = False
     bulk_update: bool = False  # Override True in sites that support bulk status updates
     url: str = "javascript:void(0)"
@@ -722,14 +730,17 @@ class Bot(Thread):
                     self.recording = False
                     # Bulk-update sites (CB/SC/CS) get their status from the
                     # LiveManager bulk poller (ONE API call per site, not per
-                    # bot), so they must not self-poll getStatus here. The old
-                    # `sc == NOTRUNNING` clause made every one of 1000+ bulk bots
-                    # fire an individual getStatus at startup -- a burst that
-                    # (especially CB via the residential proxy, with retries)
+                    # bot). They self-poll getStatus only when NOTRUNNING (no
+                    # status yet) -- which gives a freshly UI-ADDED model its
+                    # initial status promptly without waiting on the bulk poller.
+                    # That self-poll is SUPPRESSED during startup restore
+                    # (suppress_boot_poll) because firing it for all 1000+
+                    # restored bulk bots at once (CB via the proxy, with retries)
                     # saturated the GIL and stalled _restore()/app.run() for
-                    # MINUTES, so the dashboard port never came up. Non-bulk
-                    # sites have no bulk poller, so they still self-poll.
-                    if not self.bulk_update:
+                    # minutes. Non-bulk sites have no bulk poller, so always poll.
+                    if not self.bulk_update or (
+                            self.sc == Status.NOTRUNNING
+                            and not type(self).suppress_boot_poll):
                         try:
                             self.sc = self.getStatus()
                         except Exception as e:
