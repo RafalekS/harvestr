@@ -349,7 +349,14 @@ def getVideoNativeHLS(self: Bot, url: str, filename: str,  m3u_processor: Option
 
     # Session (not curl_cffi for thread safety)
     sess = requests.Session()
-    if getattr(self, 'proxy', None):
+    # Only route the PLAYLIST fetches through the proxy when capture_via_proxy is
+    # set. Chaturbate keeps it False: its playlist/segments (mmcdn edge) are NOT
+    # Cloudflare-gated -- only the chaturbate.com ajax is, and the bot's session
+    # still proxies that. Routing 1000s of 1.5s playlist polls through one
+    # residential exit overloads it (ProxyError / multi-second latency), which
+    # stalled CB capture. Playlist + segments go DIRECT; tokens are not IP-bound
+    # (verified: ajax-via-proxy + playlist/segment-via-direct both 200).
+    if getattr(self, 'proxy', None) and getattr(self, 'capture_via_proxy', True):
         sess.proxies.update({'http': self.proxy, 'https': self.proxy})
     if self.cookies:
         try:

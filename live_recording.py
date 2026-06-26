@@ -795,12 +795,20 @@ class LiveManager:
 
     def add_model(self, username: str, site: str,
                   room_id: Optional[str] = None,
-                  _sync_camsmut: bool = True) -> Dict[str, Any]:
+                  _sync_camsmut: bool = True,
+                  autostart: bool = True) -> Dict[str, Any]:
         username = (username or "").strip()
         site = (site or "").strip()
         if not username:
             raise ValueError("username required")
-        self._create_bot(username, site, room_id=room_id, autostart=False)
+        # autostart=True by default: adding a performer "to download" should
+        # immediately start tracking it (poll status + record when online).
+        # Previously autostart=False left the bot created-but-idle, so a freshly
+        # added model never tracked until the user manually clicked Start -- which
+        # is the "loads but doesn't start tracking after add" report. The UI
+        # already shows an optimistic running/"starting…" card, so this aligns
+        # the backend with what the user sees.
+        self._create_bot(username, site, room_id=room_id, autostart=autostart)
         # Mirror this user into the camsmut downloader's performers list
         # (front of queue). Suppressed by bulk_add for batched syncing.
         if _sync_camsmut:
