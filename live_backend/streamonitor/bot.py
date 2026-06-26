@@ -99,6 +99,12 @@ class Bot(Thread):
     site: Optional[str] = None
     siteslug: Optional[str] = None
     aliases: List[str] = []
+    # When True (set by LiveManager ONLY during its startup restore of 1000+
+    # saved models), Bot.__init__ SKIPS the synchronous folder scan
+    # (cache_file_list) so boot isn't blocked by per-model disk I/O; a
+    # background sweeper runs the scans just after boot. Default False keeps the
+    # native CLI path (and UI-created bots) scanning synchronously as before.
+    defer_init_scan: bool = False
     ratelimit: bool = False
     bulk_update: bool = False  # Override True in sites that support bulk status updates
     url: str = "javascript:void(0)"
@@ -192,6 +198,13 @@ class Bot(Thread):
         self.recording: bool = False
         self.video_files: List[VideoData] = []
         self.video_files_total_size: int = 0
+        # Guards the (list, size) rebind in cache_file_list so concurrent
+        # callers (bot thread post-recording, HTTP thread, the startup sweeper)
+        # can't leave video_files and video_files_total_size mutually
+        # inconsistent. _video_files_scanned lets the startup sweeper skip a bot
+        # already scanned by its own post-recording call (no double scan).
+        self._video_lock: Lock = Lock()
+        self._video_files_scanned: bool = False
         self.isRetryingDownload: bool = False
         
         self.verify_with_ffprobe: bool = True
@@ -211,10 +224,15 @@ class Bot(Thread):
         self._wake_event = Event()
         self._offline_time: float = 0
 
-        try:
-            self.cache_file_list()
-        except Exception as e:
-            self.logger.warning(f"Failed to cache file list during init: {e}")
+        # Skipped during LiveManager's bulk startup restore (defer_init_scan) so
+        # 1000+ disk scans don't block boot; the background sweeper fills these
+        # in just after. Always runs on the native CLI path and for UI-created
+        # bots (a single cheap scan).
+        if not type(self).defer_init_scan:
+            try:
+                self.cache_file_list()
+            except Exception as e:
+                self.logger.warning(f"Failed to cache file list during init: {e}")
 
     def _get_or_create_logger(self) -> log.Logger:
         """
@@ -469,8 +487,13 @@ class Bot(Thread):
                         self.logger.debug(f"Error processing video file {file.name}: {e}")
             except Exception as e:
                 self.logger.warning(f"Error scanning video folder: {e}")
-        self.video_files = _videos
-        self.video_files_total_size = _total_size
+        # The scan above ran WITHOUT the lock (it only touches locals); take it
+        # just for the tiny rebind so readers never see list/size out of sync,
+        # and mark the bot scanned so the startup sweeper skips it.
+        with self._video_lock:
+            self.video_files = _videos
+            self.video_files_total_size = _total_size
+            self._video_files_scanned = True
 
     def _sleep(self, time: Union[int, float]) -> None:
         """Interruptible sleep that checks for quit/stop/wake signals.

@@ -348,8 +348,25 @@ class LiveManager:
         # Live recordings folder — honors config.live.live_output_dir if set,
         # otherwise defaults to downloads/_live/.
         self.live_dir = self._resolve_live_dir()
-        # On startup, reconstruct from config (do NOT auto-start — user clicks)
-        self._restore()
+        # On startup, reconstruct from config (do NOT auto-start — user clicks).
+        # Defer each bot's synchronous folder scan (cache_file_list) out of
+        # __init__ so 1000+ disk scans don't block boot; the background sweeper
+        # started below fills in per-model recorded sizes within seconds. Reset
+        # the flag right after restore so UI-created bots (one cheap scan) still
+        # populate their size immediately.
+        if Bot is not None:
+            try:
+                Bot.defer_init_scan = True
+            except Exception:
+                pass
+        try:
+            self._restore()
+        finally:
+            if Bot is not None:
+                try:
+                    Bot.defer_init_scan = False
+                except Exception:
+                    pass
         # Spawn the bulk-status poller so bulk-update sites (Chaturbate,
         # CamSoda, StripChat) get ongoing status checks. Without this,
         # bulk-update bots only ever do a single getStatus() at startup
@@ -361,6 +378,53 @@ class LiveManager:
         # native CLI starts BulkStatusManager from main.py; LiveManager
         # never adopted that piece, so we add a thin shim here.)
         self._bulk_poller = self._start_bulk_poller()
+        # One-shot background sweep to run the folder scans deferred during
+        # _restore() above, without blocking boot.
+        self._scan_sweeper = self._start_scan_sweeper()
+
+    def _start_scan_sweeper(self):
+        """One-shot daemon that runs each bot's deferred folder scan
+        (cache_file_list) after boot, throttled so 1000+ disk scans don't spike
+        CPU/disk at startup. A model's recorded size shows 0 until the sweep
+        reaches it (a few seconds); new recordings still update size via the
+        bot's own post-recording scan, which sets _video_files_scanned so the
+        sweep skips that bot (no double scan). Tunable via
+        HARVESTR_SCAN_SWEEP_DELAY (seconds between bots; default 0.05)."""
+        if not available or Bot is None:
+            return None
+        import time as _time
+        try:
+            delay = float(os.environ.get("HARVESTR_SCAN_SWEEP_DELAY", "0.05"))
+        except Exception:
+            delay = 0.05
+
+        def _loop() -> None:
+            # One-shot snapshot: _restore() ran synchronously before this thread
+            # was started, so every restored bot is already in _models. Bots
+            # added later via the UI scan synchronously in __init__ (the defer
+            # flag is already reset), so a single pass covers everything. Snap
+            # under the lock, then scan OUTSIDE it.
+            with self._lock:
+                bots = [rm.bot for rm in self._models.values()]
+            scanned = 0
+            for bot in bots:
+                if getattr(bot, "_video_files_scanned", False):
+                    continue
+                try:
+                    bot.cache_file_list()
+                    scanned += 1
+                except Exception as e:
+                    log.debug(f"[live] scan sweep {getattr(bot, 'username', '?')}: "
+                              f"{type(e).__name__}: {e}")
+                if delay > 0:
+                    _time.sleep(delay)
+            log.info(f"[live] startup folder-scan sweep done "
+                     f"({scanned} scanned of {len(bots)})")
+
+        t = threading.Thread(target=_loop, name="live-scan-sweeper",
+                             daemon=True)
+        t.start()
+        return t
 
     def _start_bulk_poller(self):
         """Start a daemon thread that calls each bulk-capable site's
