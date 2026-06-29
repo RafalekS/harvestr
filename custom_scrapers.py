@@ -304,8 +304,11 @@ def load_netscape_cookies(cookies_file: str) -> Optional[MozillaCookieJar]:
             load_path = tmp_path
         else:
             load_path = cookies_file
+        import warnings
         cj = MozillaCookieJar(load_path)
-        cj.load(ignore_discard=True, ignore_expires=True)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            cj.load(ignore_discard=True, ignore_expires=True)
         return cj
     except Exception:
         return None
@@ -333,10 +336,11 @@ class SiteScraper(ABC):
     # KVS mirrors and search-based scrapers leave this False (default).
     AUTHORITATIVE_USER: bool = False
 
-    def __init__(self, log: logging.Logger, cookies_file: str = ""):
+    def __init__(self, log: logging.Logger, cookies_file: str = "", proxy: str = ""):
         self.log = log
         self._session: Optional[requests.Session] = None
         self.cookies_file = cookies_file
+        self.proxy = proxy
         self._cookie_jar: Optional[MozillaCookieJar] = None
         if cookies_file:
             self._cookie_jar = load_netscape_cookies(cookies_file)
@@ -366,6 +370,11 @@ class SiteScraper(ABC):
                     s.cookies.set(c.name, c.value, domain=c.domain, path=c.path or "/")
                 except Exception:
                     pass
+        if self.proxy:
+            p = self.proxy
+            if p.startswith("socks5://"):
+                p = "socks5h://" + p[9:]  # DNS through proxy (required for Tor)
+            s.proxies = {"http": p, "https": p}
         return s
 
     @property
@@ -1464,13 +1473,15 @@ class CoomerKemonoBase(SiteScraper):
             # Shard hosts are nN.<apex>
             shard = f"n1.{host}"
             try:
-                sock = __import__("socket").create_connection((shard, 443), timeout=5)
-                sock.close()
+                # Use self.session so the check routes through any configured
+                # proxy (e.g. Tor) — raw sockets would bypass SOCKS proxies.
+                self.session.head(f"https://{shard}/", timeout=6, allow_redirects=False)
                 is_up = True
-            except OSError as e:
+            except Exception as e:
                 self.log.warning(f"  [{self.NAME}] shard CDN unreachable "
-                                 f"({shard}: {e.__class__.__name__}) — "
-                                 f"downloads would fail, skipping download phase")
+                                 f"({shard}: {e.__class__.__name__}) "
+                                 f"via {'proxy' if self.proxy else 'direct'} "
+                                 f"-- downloads would fail, skipping download phase")
                 is_up = False
         except Exception as e:
             self.log.debug(f"  [{self.NAME}] CDN health probe: {e}")
@@ -1479,10 +1490,9 @@ class CoomerKemonoBase(SiteScraper):
         return is_up
 
     def _make_session(self) -> requests.Session:
-        s = requests.Session()
-        # DDoS-Guard bypass: server instruction is to send Accept: text/css
+        s = super()._make_session()  # inherits proxy + cookies from SiteScraper
+        # DDoS-Guard bypass: override Accept header
         s.headers.update({
-            "User-Agent": USER_AGENT,
             "Accept": "text/css",
             "Accept-Encoding": "gzip",
             "Accept-Language": "en-US,en;q=0.9",
@@ -2677,7 +2687,8 @@ class Fapello(SiteScraper):
     BASE_URL = "https://fapello.com"
     CATEGORY = "mirror"   # OF/IG archive — grouped with coomer/kemono in UI
     MIN_ENTRIES = 1
-    AUTHORITATIVE_USER = True   # URL path is username-gated → no slug filter
+    AUTHORITATIVE_USER = True
+    download_images: bool = False   # set by UniversalDownloader from config   # URL path is username-gated → no slug filter
 
     def _slug_variants(self, username: str) -> List[str]:
         """Fapello uses username-without-underscores. blondie_254 → blondie254."""
@@ -2783,30 +2794,61 @@ class Fapello(SiteScraper):
             }
             return True
 
-        # If the post is image-only, mark as skip (we are a video downloader)
+        # Image-only post handling
         imgs = re.findall(
-            r'<img[^>]+src=["\'](https?://[^"\']+fapello\.[a-z]+/content/[^"\']+)["\']',
+            r'<img[^>]+src=["\'](https?://[^"\' ]+fapello\.[a-z]+/content/[^"\' ]+)["\']',
             r.text, re.IGNORECASE,
         )
-        if imgs:
-            # Try to find a matching .mp4 (sometimes the gallery swaps out
-            # the image src for a video at play time)
-            guess = re.sub(r"\.(jpg|png|webp)($|\?)", r".mp4\2", imgs[0], flags=re.I)
-            if guess != imgs[0]:
+        # Construct CDN URL from slug + post number when not in HTML (lazy-loaded)
+        if not imgs and getattr(self, 'download_images', False):
+            slug = video.uploader_id or video.video_id.rsplit('_', 1)[0]
+            pid_str = video.video_id.rsplit('_', 1)[-1] if '_' in video.video_id else ''
+            if slug and pid_str.isdigit():
+                c1, c2 = slug[0], slug[1] if len(slug) > 1 else slug[0]
+                candidate = f"{self.BASE_URL}/content/{c1}/{c2}/{slug}/1000/{slug}_{int(pid_str):04d}.jpg"
                 try:
-                    h = self.session.head(guess, timeout=8, allow_redirects=True)
-                    if h.status_code == 200 and "video" in (h.headers.get("Content-Type","").lower()):
-                        video.stream_url = guess
-                        video.stream_kind = "mp4"
-                        video.stream_headers = {
-                            "User-Agent": USER_AGENT,
-                            "Referer": video.video_url,
-                        }
-                        return True
+                    h = self.session.head(candidate, timeout=8, allow_redirects=True,
+                                          headers={"Referer": self.BASE_URL + "/"})
+                    if h.status_code == 200:
+                        imgs = [candidate]
                 except Exception:
                     pass
-            video.stream_kind = "private"   # image-only, treat as skip
-            return False
+        if imgs:
+            if getattr(self, 'download_images', False):
+                # Try .mp4 version first (some posts have both)
+                guess = re.sub(r"\.(jpg|png|webp)($|\?)", r".mp4\2", imgs[0], flags=re.I)
+                if guess != imgs[0]:
+                    try:
+                        h = self.session.head(guess, timeout=8, allow_redirects=True)
+                        if h.status_code == 200 and "video" in h.headers.get("Content-Type", "").lower():
+                            video.stream_url = guess
+                            video.stream_kind = "mp4"
+                            video.stream_headers = {"User-Agent": USER_AGENT, "Referer": video.video_url}
+                            return True
+                    except Exception:
+                        pass
+                # Download as image
+                img_url = imgs[0].split('?')[0]
+                ext = img_url.rsplit('.', 1)[-1].lower() if '.' in img_url else 'jpg'
+                video.stream_url = imgs[0]
+                video.stream_kind = ext
+                video.stream_headers = {"User-Agent": USER_AGENT, "Referer": video.video_url}
+                return True
+            else:
+                # Try to find a matching .mp4
+                guess = re.sub(r"\.(jpg|png|webp)($|\?)", r".mp4\2", imgs[0], flags=re.I)
+                if guess != imgs[0]:
+                    try:
+                        h = self.session.head(guess, timeout=8, allow_redirects=True)
+                        if h.status_code == 200 and "video" in h.headers.get("Content-Type", "").lower():
+                            video.stream_url = guess
+                            video.stream_kind = "mp4"
+                            video.stream_headers = {"User-Agent": USER_AGENT, "Referer": video.video_url}
+                            return True
+                    except Exception:
+                        pass
+                video.stream_kind = "private"   # image-only, treat as skip
+                return False
         return False
 
 
@@ -4004,7 +4046,7 @@ class HQPorner(SiteScraper):
         "ads.exoclick", "googletag", "doubleclick", "googlesyndication",
         "google-analytics", "googletagmanager", "amazon-adsystem",
         "trafficjunky", "rtmark", "exosrv", "popcash", "adsterra",
-        "mgid.com", "exo.tag",
+        "mgid.com", "exo.tag", "adtng.com", "mnaspm.com",
     )
 
     _MAX_PAGES = 30
@@ -4137,6 +4179,15 @@ class HQPorner(SiteScraper):
             return False
         if _looks_like_soft_404(r.text):
             return False
+        # HQPorner silently serves the homepage for deleted/invalid video URLs
+        # (no redirect, 200 OK, but page title is the generic site title).
+        # Detect this by checking the og:title / <title> in the first 2KB.
+        head2k = r.text[:2000].lower()
+        if "hd porn videos tube" in head2k or "thousands of high definition" in head2k:
+            self.log.debug(
+                f"  [{self.NAME}] {video.video_url} returned homepage — video deleted or URL changed"
+            )
+            return False
         iframe_url = self._pick_player_iframe(r.text)
         if not iframe_url:
             self.log.debug(f"  [{self.NAME}] no player iframe in {video.video_url}")
@@ -4240,6 +4291,217 @@ class HQPorner(SiteScraper):
         return False
 
 
+
+
+# ── PornHD3X ──────────────────────────────────────────────────────────────
+
+class PornHD3X(SiteScraper):
+    """pornhd3x.tv — studio-based scraper.
+    Pornstar pages are Cloudflare-protected; studio pages work with plain requests.
+    Username maps to the studio slug (e.g. "vixen" -> /studio/vixen).
+    """
+    NAME = "pornhd3x"
+    BASE_URL = "https://www.pornhd3x.tv"
+    CATEGORY = "adult"
+    USE_CLOUDSCRAPER = False
+    MIN_ENTRIES = 1
+    AUTHORITATIVE_USER = True
+
+    _VIDEO_LINK_RE = re.compile(r'href="(/movies/([^"/?#]+))"', re.IGNORECASE)
+    _TITLE_RE = re.compile(r'<title>([^<]+)</title>', re.IGNORECASE)
+    _OG_TITLE_RE = re.compile(r'<meta[^>]+property="og:title"[^>]+content="([^"]+)"', re.IGNORECASE)
+
+    _AD_FRAGMENTS = (
+        'stripchat', 'chaturbate', 'livejasmin', 'bongacams',
+        'adserver', 'doubleclick', 'googlesyndication', 'googletag',
+        'exoclick', 'trafficjunky', 'juicyads', 'tsyndicate',
+        'tsvideo.sacdnssedge.com', '/ol_',
+    )
+
+    _STREAM_PATTERNS = [
+        re.compile(r'"(https?://[^"]+\.m3u8[^"]*)"', re.IGNORECASE),
+        re.compile(r'"(https?://[^"]+\.mp4[^"]*)"', re.IGNORECASE),
+        re.compile(r"""file:\s*["']([^"']+\.m3u8[^"']*)["']""", re.IGNORECASE),
+        re.compile(r"""file:\s*["']([^"']+\.mp4[^"']*)["']""", re.IGNORECASE),
+        re.compile(r"""(?:data-src|src)=["'](https?://[^"']+\.(?:m3u8|mp4)[^"']*)["']""", re.IGNORECASE),
+        re.compile(r"""<source[^>]+src=["'](https?://[^"']+\.(?:m3u8|mp4))["']""", re.IGNORECASE),
+    ]
+
+    _MAX_PAGES = 50
+    _PAGE_DELAY = 0.5
+    # Lulustream embed detection — videos with JS-tokenized CDN URLs
+    _LULUSTREAM_EMBED_RE = re.compile(
+        r'(?:src|data-src)\s*=\s*["\'](?:https?:)?//(?:www\.)?lulustream\.com/e/([A-Za-z0-9]+)',
+        re.IGNORECASE
+    )
+    _LULUSTREAM_CDN_RE = re.compile(r'lulustream\.com', re.IGNORECASE)
+
+    def _get(self, url: str, referer: str = "") -> Optional[requests.Response]:
+        headers = {"Referer": referer or self.BASE_URL}
+        try:
+            r = self.session.get(url, headers=headers, timeout=20, allow_redirects=True)
+        except Exception as e:
+            self.log.debug(f"  [{self.NAME}] GET {url}: {e}")
+            return None
+        if r.status_code != 200:
+            return None
+        # Cloudflare block = tiny response (1-5 bytes)
+        if len(r.content) < 200:
+            return None
+        return r
+
+    def probe(self, username: str) -> Optional[ProbeHit]:
+        slug = username.lower().replace(" ", "-")
+        url = f"{self.BASE_URL}/studio/{slug}"
+        r = self._get(url)
+        if r is None:
+            return None
+        # Need at least one video link to confirm it's a real studio page
+        links = self._VIDEO_LINK_RE.findall(r.text)
+        if not links:
+            return None
+        return ProbeHit(
+            site=self.NAME,
+            url=url,
+            entry_count=len(links),
+            uploader_id=slug,
+        )
+
+    def enumerate(self, hit: ProbeHit, username: str, limit: int) -> List[VideoRef]:
+        slug = hit.uploader_id or username.lower().replace(" ", "-")
+        videos: List[VideoRef] = []
+        seen: set = set()
+
+        for page in range(1, self._MAX_PAGES + 1):
+            if page == 1:
+                url = f"{self.BASE_URL}/studio/{slug}"
+            else:
+                url = f"{self.BASE_URL}/studio/{slug}/page-{page}"
+
+            r = self._get(url, referer=f"{self.BASE_URL}/studio/{slug}")
+            if r is None:
+                break
+
+            links = self._VIDEO_LINK_RE.findall(r.text)
+            if not links:
+                break
+
+            new_on_page = 0
+            for rel_path, slug_id in links:
+                if slug_id in seen:
+                    continue
+                seen.add(slug_id)
+                new_on_page += 1
+                video_url = f"{self.BASE_URL}{rel_path}"
+                title = slug_id.replace("-", " ").title()
+                videos.append(VideoRef(
+                    site=self.NAME,
+                    video_id=slug_id,
+                    video_url=video_url,
+                    title=title,
+                    performer=username,
+                ))
+                if limit and len(videos) >= limit:
+                    return videos
+
+            if new_on_page == 0:
+                break
+
+            time.sleep(self._PAGE_DELAY)
+
+        return videos
+
+    def extract_stream(self, video: VideoRef) -> bool:
+        r = self._get(video.video_url, referer=self.BASE_URL)
+        if r is None:
+            self.log.debug(f"  [{self.NAME}] fetch failed: {video.video_url}")
+            return False
+
+        html = r.text
+
+        # Update title from page metadata
+        m = self._OG_TITLE_RE.search(html) or self._TITLE_RE.search(html)
+        if m:
+            t = m.group(1).strip()
+            if t and len(t) > len(video.title):
+                video.title = t
+
+        # Find stream URLs, filter ads
+        found: List[str] = []
+        for pat in self._STREAM_PATTERNS:
+            for u in pat.findall(html):
+                if any(ad in u.lower() for ad in self._AD_FRAGMENTS):
+                    continue
+                if u not in found:
+                    found.append(u)
+
+        # Detect lulustream embed — CDN URLs from the main page use JS-rendered
+        # tokens that expire before aria2c/curl can download them. Try the embed
+        # page directly instead.
+        lulu_m = self._LULUSTREAM_EMBED_RE.search(html)
+        if lulu_m:
+            embed_code = lulu_m.group(1)
+            embed_url = f"https://www.lulustream.com/e/{embed_code}"
+            self.log.debug(f"  [{self.NAME}] lulustream embed detected: {embed_url}")
+            # Remove lulustream CDN URLs from found (JS-token based, unreliable)
+            found = [u for u in found if not self._LULUSTREAM_CDN_RE.search(u)]
+            if not found:
+                # Try embed_extractors (yt-dlp with impersonation, Playwright fallback)
+                try:
+                    import embed_extractors
+                    result = embed_extractors.extract_embed_stream(embed_url, log=self.log)
+                    if result and result.stream_url:
+                        video.stream_url = result.stream_url
+                        video.stream_kind = result.stream_kind
+                        video.stream_headers = result.headers or {
+                            "User-Agent": USER_AGENT,
+                            "Referer": "https://www.lulustream.com/",
+                        }
+                        self.log.debug(f"  [{self.NAME}] lulustream via embed_extractors OK: {result.stream_url[:80]}")
+                        return True
+                except Exception as e:
+                    self.log.debug(f"  [{self.NAME}] lulustream embed_extractors error: {e}")
+                # Plain HTTP fallback — try fetching embed page directly
+                r2 = self._get(embed_url, referer=video.video_url)
+                if r2:
+                    for pat in self._STREAM_PATTERNS:
+                        for u in pat.findall(r2.text):
+                            if any(ad in u.lower() for ad in self._AD_FRAGMENTS):
+                                continue
+                            if u not in found:
+                                found.append(u)
+                if found:
+                    m3u8 = [u for u in found if ".m3u8" in u.lower()]
+                    mp4 = [u for u in found if ".mp4" in u.lower()]
+                    chosen = (m3u8 or mp4)[0] if (m3u8 or mp4) else found[0]
+                    video.stream_url = chosen
+                    video.stream_kind = "hls" if ".m3u8" in chosen.lower() else "mp4"
+                    video.stream_headers = {
+                        "User-Agent": USER_AGENT,
+                        "Referer": "https://www.lulustream.com/",
+                    }
+                    return True
+                self.log.debug(f"  [{self.NAME}] lulustream: all extraction methods failed for {embed_url}")
+                return False
+
+        if not found:
+            self.log.debug(f"  [{self.NAME}] no stream found in {video.video_url}")
+            return False
+
+        # Prefer m3u8 (adaptive quality) over mp4
+        m3u8 = [u for u in found if ".m3u8" in u.lower()]
+        mp4 = [u for u in found if ".mp4" in u.lower()]
+        chosen = (m3u8 or mp4)[0] if (m3u8 or mp4) else found[0]
+
+        video.stream_url = chosen
+        video.stream_kind = "hls" if ".m3u8" in chosen.lower() else "mp4"
+        video.stream_headers = {
+            "User-Agent": USER_AGENT,
+            "Referer": self.BASE_URL + "/",
+        }
+        return True
+
+
 # ── Registry ──────────────────────────────────────────────────────────────
 
 ALL_SCRAPER_CLASSES = [
@@ -4268,6 +4530,8 @@ ALL_SCRAPER_CLASSES = [
     Erome,
     # Mainstream tube + cam-archive aggregators (May 2026 expansion)
     PornHat, OkXxx, PornDoe, HQPorner,
+    # Tube sites with studio pages (plain requests, no yt-dlp extractor)
+    PornHD3X,
     # Auth-required (only activates if cookies_file is set with valid cookies)
     XCom, Recume,
     # Login-required (username/password — auto-login on first probe)
@@ -4278,6 +4542,7 @@ ALL_SCRAPER_CLASSES = [
 def load_scrapers(log: logging.Logger, enabled_names: Optional[List[str]] = None,
                    cookies_file: str = "",
                    site_credentials: Optional[Dict[str, Dict[str, str]]] = None,
+                   proxy: str = "",
                    ) -> List[SiteScraper]:
     """Instantiate all custom scrapers.
 
@@ -4299,7 +4564,7 @@ def load_scrapers(log: logging.Logger, enabled_names: Optional[List[str]] = None
         if enabled_names and cls.NAME not in enabled_names:
             continue
         try:
-            out.append(cls(log, cookies_file=cookies_file))
+            out.append(cls(log, cookies_file=cookies_file, proxy=proxy))
         except Exception as e:
             log.warning(f"Failed to init {cls.NAME}: {e}")
     return out
@@ -4400,5 +4665,6 @@ __all__ = [
     "CamwhoresTV", "CamwhoresCO", "CamwhoresHD", "CamwhoresBay",
     "CamVideosTV", "CamhubCC", "CamwhCom", "CambroTV",
     "ALL_SCRAPER_CLASSES", "load_scrapers",
+    "PornHD3X",
     "USER_AGENT", "parse_kvs_flashvars", "kvs_get_real_url", "mixdrop_build_url",
 ]

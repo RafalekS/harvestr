@@ -1,12 +1,22 @@
 # Core
 yt-dlp[default,curl-cffi]>=2026.01.01
-requests>=2.31.0
+requests[socks]>=2.31.0
 cloudscraper>=1.2.71
 curl-cffi>=0.7.0
 rich>=13.7.0
 
 # Web UI
 flask>=3.0.0
+
+# Live recording (StreaMonitor vendored backend dependencies)
+m3u8>=3.0.0
+filelock>=3.0.0
+django-environ>=0.11.0
+playwright>=1.40.0
+websocket-client>=1.6.0
+beautifulsoup4>=4.12.0
+fake-useragent>=1.4.0
+aiohttp>=3.9.0
 
 # Optional (system binaries, install separately):
 # - aria2c        → winget install aria2.aria2        (16x parallel MP4 downloads)

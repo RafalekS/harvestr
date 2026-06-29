@@ -23,6 +23,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -38,8 +39,28 @@ except ImportError:
     sys.exit(1)
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-CONFIG_PATH = SCRIPT_DIR / "config.json"
-DOWNLOADS_DIR = SCRIPT_DIR / "downloads"
+
+# Parse --config early so CONFIG_PATH is set before Flask routes are defined
+_ap = argparse.ArgumentParser(add_help=False)
+_ap.add_argument("--config", default=None)
+_early, _ = _ap.parse_known_args()
+CONFIG_PATH = Path(os.path.expandvars(os.path.expanduser(_early.config))) if _early.config else SCRIPT_DIR / "config.json"
+
+def _get_downloads_dir() -> Path:
+    """Use output_dir from config.json if set, so webui reads the same
+    location the downloader writes to."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+        od = cfg.get("output_dir", "").strip()
+        if od:
+            p = Path(os.path.expandvars(os.path.expanduser(od)))
+            p.mkdir(parents=True, exist_ok=True)
+            return p
+    except Exception:
+        pass
+    return SCRIPT_DIR / "downloads"
+
+DOWNLOADS_DIR = _get_downloads_dir()
 HISTORY_PATH = DOWNLOADS_DIR / "history.json"
 FAILED_PATH = DOWNLOADS_DIR / "failed.json"
 LOG_PATH = DOWNLOADS_DIR / "universal.log"
@@ -104,6 +125,7 @@ _state = {
 }
 _state_lock = threading.Lock()
 _runner_thread: subprocess.Popen | None = None
+_run_queue: list = []   # performer names (or None=all) waiting to run
 
 # ── Mutual-exclusion helpers (Live ⇄ Archive) ────────────────────────────────
 # Only one mode can be active at a time. Starting Archive stops all Live bots
@@ -259,6 +281,45 @@ def _stop_all_live_bots() -> int:
 # stuck-true and disable the Start button forever.
 try:
     _clear_stale_progress()
+except Exception:
+    pass
+
+
+def _maybe_autostart_tor() -> None:
+    """If start_tor_on_startup is set in config, launch tor_helper --start in background."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return
+    if not cfg.get("start_tor_on_startup"):
+        return
+    import threading, subprocess as _sp
+    def _start():
+        try:
+            r = _sp.run(
+                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--start"],
+                capture_output=True, text=True, timeout=150,
+            )
+            proxy = r.stdout.strip()
+            if r.returncode == 0 and proxy.startswith("socks5://"):
+                # Persist the proxy URL back into config so the downloader picks it up
+                try:
+                    c = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+                    c["download_proxy"] = proxy
+                    CONFIG_PATH.write_text(json.dumps(c, indent=2, ensure_ascii=False),
+                                           encoding="utf-8")
+                except Exception:
+                    pass
+                print(f"[tor-startup] Tor running at {proxy}", flush=True)
+            else:
+                print(f"[tor-startup] Tor failed to start: {r.stderr.strip()}", flush=True)
+        except Exception as e:
+            print(f"[tor-startup] error: {e}", flush=True)
+    threading.Thread(target=_start, daemon=True, name="tor-autostart").start()
+
+
+try:
+    _maybe_autostart_tor()
 except Exception:
     pass
 
@@ -515,10 +576,16 @@ def read_progress() -> dict:
     path = DOWNLOADS_DIR / "_progress.json"
     if not path.exists():
         return {"session": {"running": False}, "active": []}
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {"session": {"running": False}, "active": []}
+    # The downloader rewrites this file constantly (atomically, but over SMB a
+    # reader can still briefly hit it mid-replace). Retry before reporting "idle"
+    # so the UI's Active downloads card doesn't flicker off.
+    for _attempt in range(3):
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except Exception:
+            if _attempt < 2:
+                time.sleep(0.05)
+    return {"session": {"running": False}, "active": []}
 
 
 def cookies_diagnostics() -> dict:
@@ -749,9 +816,29 @@ INDEX_HTML = r"""
   .perf-row:hover { background: var(--bg-3); border-color: var(--border); }
   .perf-row.selected { background: linear-gradient(90deg, #2a6cb340, #2a6cb310);
                         border-color: var(--accent-2); }
-  .perf-row .name { font-weight: 500; }
+  .perf-row .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .perf-row .count { margin-left: auto; color: var(--text-3); font-size: 11.5px; }
-  .perf-list { max-height: 420px; overflow-y: auto; padding-right: 4px; }
+  .perf-row .imgcount { color: var(--accent-2, #6ab0f3); font-size: 11.5px; }
+  .perf-row .pinfo { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+  .perf-row .pmeta { font-size: 10.5px; color: var(--text-3); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .perf-row .pmeta.none { color: #c9913f; }
+  .perf-row .pmeta .ok { color: #46b96a; }
+  .perf-row .pmeta .fail { color: #d9534f; }
+  .perf-row .pmeta .skip { color: var(--text-3); }
+  .perf-toolbar { display: flex; gap: 6px; margin-bottom: 8px; }
+  .perf-toolbar input { flex: 1; min-width: 0; }
+  .perf-toolbar select { flex: 0 0 auto; max-width: 130px; }
+  .perf-list { flex: 1; min-height: 0; overflow-y: auto; overflow-x: hidden; padding-right: 4px; }
+  .queue-item { display:flex; align-items:center; gap:6px; padding:5px 8px; margin-bottom:4px; background:var(--card2,#2a2a2a); border:1px solid var(--border); border-radius:6px; font-size:12px; cursor:grab; user-select:none; }
+  .queue-item:active { cursor:grabbing; opacity:0.7; }
+  .queue-item .q-num { color:var(--muted); min-width:16px; }
+  .queue-item .q-name { flex:1; }
+  .queue-item { display:flex; align-items:center; gap:6px; padding:5px 8px; margin-bottom:4px;
+    background:var(--card2,#2a2a2a); border:1px solid var(--border); border-radius:6px;
+    font-size:12px; cursor:grab; user-select:none; }
+  .queue-item:active { cursor:grabbing; opacity:0.7; }
+  .queue-item .q-num { color:var(--muted); min-width:16px; }
+  .queue-item .q-name { flex:1; }
 
   .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 18px; }
   .stat-box {
@@ -840,6 +927,10 @@ INDEX_HTML = r"""
   }
   @keyframes shimmer { 0%{background-position:0% 0;} 100%{background-position:200% 0;} }
   .dl-empty { color: var(--text-3); font-size: 12.5px; padding: 12px; text-align: center; }
+  /* Reserve a fixed area for the active-download file rows so the card height
+     stays put as downloads start/finish (no more page jumping). Sized for the
+     max parallel slots; scrolls if there are somehow more. */
+  .progress-card .dl-rows { height: 220px; overflow-y: auto; overflow-x: hidden; }
 
   .phase-panel {
     background: #0b1320; border: 1px solid #1c2438; border-radius: 8px;
@@ -1560,6 +1651,11 @@ INDEX_HTML = r"""
     border: 2px dashed var(--border); border-radius: 12px; font-size: 13.5px;
   }
   .empty-state .big-icon { width: 48px; height: 48px; margin-bottom: 12px; color: var(--border-2); }
+
+      details#auth-details-wrapper[open] .auth-chevron { transform: rotate(180deg); }
+      details#auth-details-wrapper > summary { border-radius: var(--radius, 6px); }
+      details#auth-details-wrapper > summary .icon { width: 15px; height: 15px; color: var(--accent); flex-shrink: 0; }
+      details#auth-details-wrapper[open] > summary { border-bottom-left-radius: 0; border-bottom-right-radius: 0; }
 </style>
 </head>
 <body>
@@ -1673,7 +1769,7 @@ INDEX_HTML = r"""
   <div class="grid">
 
     <!-- Performers -->
-    <div class="card">
+    <div class="card" id="performers-card" style="display:flex; flex-direction:column; overflow:hidden;">
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87M16 3.13a4 4 0 0 1 0 7.75"/></svg>
         Performers
@@ -1692,15 +1788,39 @@ INDEX_HTML = r"""
           Bulk
         </button>
       </div>
+      <div class="perf-toolbar">
+        <input id="perf-search" type="text" placeholder="Filter by name…" oninput="renderPerformers()" aria-label="Filter performers by name" />
+        <select id="perf-sort" onchange="_perfPrefSave(); renderPerformers()" title="Sort performers">
+          <option value="name">Name A–Z</option>
+          <option value="videos-desc">Most videos</option>
+          <option value="videos-asc">Fewest videos</option>
+          <option value="images-desc">Most images</option>
+          <option value="total-desc">Most downloads</option>
+          <option value="lastrun-desc">Last run (newest)</option>
+          <option value="lastrun-asc">Last run (oldest)</option>
+          <option value="runs-desc">Most runs</option>
+        </select>
+        <select id="perf-filter" onchange="_perfPrefSave(); renderPerformers()" title="Filter performers">
+          <option value="all">All</option>
+          <option value="has-videos">Has videos</option>
+          <option value="no-videos">0 videos</option>
+          <option value="never-run">No runs logged</option>
+          <option value="has-images">Has images</option>
+        </select>
+      </div>
       <div class="perf-list" id="perf-list"></div>
       <div class="flex" style="margin-top: 12px; border-top: 1px solid var(--border); padding-top: 12px;">
         <button class="success" onclick="runSinglePerformer()">▶ Run selected</button>
-        <span class="muted">Click a performer to select</span>
+        <span class="muted" id="perf-sel-label">Click a performer to select</span>
+      </div>
+      <div id="run-queue-box" style="display:none; margin-top:8px; border-top:1px solid var(--border); padding-top:8px;">
+        <div class="muted" style="font-size:12px; margin-bottom:4px;">Queue <button class="xs danger" style="margin-left:6px;" onclick="clearQueue()">Clear all</button></div>
+        <div id="run-queue-list"></div>
       </div>
     </div>
 
     <!-- Settings -->
-    <div class="card">
+    <div class="card" id="settings-card">
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
         Settings
@@ -1711,15 +1831,25 @@ INDEX_HTML = r"""
         <tr><td>Max parallel downloads</td><td><input id="cfg-max-parallel" type="text"/></td></tr>
         <tr><td>aria2c connections</td><td><input id="cfg-aria2c-conn" type="text"/></td></tr>
         <tr><td>Min disk GB</td><td><input id="cfg-min-disk" type="text"/></td></tr>
+        <tr><td>Min video size (MB)</td><td><input id="cfg-min-size" type="text" placeholder="0 = disabled"/></td></tr>
         <tr><td>Min duration (s)</td><td><input id="cfg-min-dur" type="text"/></td></tr>
         <tr><td>Rate limit</td><td><input id="cfg-rate" type="text" placeholder="e.g. 500K, 2M, blank = unlimited"/></td></tr>
         <tr><td>Cookies file</td><td><input id="cfg-cookies" type="text" placeholder="Path to cookies.txt (Netscape)"/></td></tr>
-        <tr><td>Impersonate</td><td><input id="cfg-imp" type="text" placeholder="chrome"/></td></tr>
+        <tr><td>Impersonate</td><td><input id="cfg-imp" type="text" placeholder="chrome (recommended)"/></td></tr>
         <tr><td>Download proxy</td><td>
           <div style="display:flex; gap:6px; align-items:center;">
             <input id="cfg-proxy" type="text" placeholder="http://host:port, socks5://127.0.0.1:9055 (Tor), blank = none" style="flex:1;"/>
             <button class="xs" onclick="enableTor()" data-tip="Auto-start embedded Tor and fill in SOCKS URL">Use Tor</button>
           </div>
+        </td></tr>
+        <tr><td>Auto-start Tor</td><td>
+          <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
+            <input id="cfg-tor-startup" type="checkbox"/>
+        </td></tr>
+        <tr><td>Download images</td><td>
+            <input id="cfg-download-images" type="checkbox"/> Also download image posts (fapello etc.)
+            Start Tor automatically when harvestr launches
+          </label>
         </td></tr>
         <tr><td>CamSmut user</td><td><input id="cfg-cs-user" type="text" placeholder="(empty = skip camsmut)"/></td></tr>
         <tr><td>CamSmut password</td><td><input id="cfg-cs-pass" type="password" placeholder=""/></td></tr>
@@ -1760,14 +1890,23 @@ INDEX_HTML = r"""
           </button>
         </div>
       </div>
+      <!-- Queue -->
+      <h3 style="margin-top:18px; margin-bottom:8px; font-size:13px; font-weight:600; color:var(--text);">Run Queue</h3>
+      <p class="muted" style="font-size:12px; margin-bottom:8px;">Performers waiting to run. Drag to reorder or use arrows.</p>
+      <div id="queue-settings-list" style="min-height:32px;"></div>
+      <div style="margin-top:6px;">
+        <button class="xs danger" onclick="clearQueue()">Clear all</button>
+      </div>
     </div>
 
-    <!-- Sites picker with category tabs -->
-    <div class="card">
+    <!-- Sites picker -->
+    <details open>
+    <summary class="card" style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;user-select:none;"><svg style="flex-shrink:0;width:13px;height:13px;transition:transform .2s;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
         Sites to scrape <span class="muted" style="margin-left:auto; font-weight:normal;" id="sites-count"></span>
-      </h2>
+      </h2></summary>
+    <div class="card" style="margin-top:6px;">
       <div class="site-tabs" id="site-tabs">
         <div class="tab active" data-cat="all" onclick="setSiteCat('all')">All</div>
         <div class="tab" data-cat="mainstream" onclick="setSiteCat('mainstream')">Mainstream</div>
@@ -1782,10 +1921,11 @@ INDEX_HTML = r"""
         <span class="muted" style="margin-left:auto;"><span style="color: var(--warn)">●</span> = needs cookies</span>
       </div>
       <div class="site-list" id="sites-list"></div>
-    </div>
+    </div></details>
 
     <!-- Live log -->
-    <div class="card">
+    <details open>
+    <summary class="card" style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;user-select:none;"><svg style="flex-shrink:0;width:13px;height:13px;transition:transform .2s;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         Live log
@@ -1795,28 +1935,47 @@ INDEX_HTML = r"""
             auto-scroll
           </label>
         </span>
-      </h2>
+      </h2></summary>
+    <div class="card" style="margin-top:6px;">
+      <div style="display:flex; align-items:center; gap:10px; margin-bottom:6px; flex-wrap:wrap;">
+        <label style="display:inline-flex; align-items:center; gap:4px; font-size:12px; cursor:pointer;">
+          <input type="checkbox" id="log-errors-only" style="width:12px;height:12px;margin:0;" onchange="renderLog()"/>
+          Errors only
+        </label>
+        <select id="log-timeframe" style="font-size:12px; padding:2px 4px;" onchange="renderLog()">
+          <option value="0">All time</option>
+          <option value="5">Last 5 min</option>
+          <option value="15">Last 15 min</option>
+          <option value="60">Last 1 hour</option>
+          <option value="360">Last 6 hours</option>
+        </select>
+        <button class="xs" onclick="copyLogErrors()" style="margin-left:auto;">Copy errors</button>
+      </div>
       <div class="log-viewer" id="log-viewer"></div>
-    </div>
+    </div></details>
 
-    <!-- Auth setup (full width) -->
-    <div class="card" style="grid-column: 1 / -1;">
-      <h2>
+    <!-- Auth setup (full width) — collapsed by default -->
+    <details id="auth-details-wrapper" style="grid-column: 1 / -1;">
+      <summary class="card" style="display:flex; align-items:center; gap:8px; cursor:pointer; list-style:none; user-select:none;">
+        <svg style="flex-shrink:0; width:14px; height:14px; transition:transform .2s;" class="auth-chevron" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
-        Authentication &amp; paid accounts
+        <h2 style="margin:0; font-size:inherit; font-weight:600;">Authentication &amp; paid accounts</h2>
         <span class="muted" style="font-weight:normal; margin-left:auto;" id="auth-summary"></span>
-      </h2>
-      <div id="auth-list"></div>
-    </div>
+      </summary>
+      <div class="card" style="margin-top:6px; border-top-left-radius:0; border-top-right-radius:0;">
+        <div id="auth-list"></div>
+      </div>
+    </details>
 
-    <!-- Storage / Disk Management -->
-    <div class="card" style="grid-column: 1 / -1;">
+    <!-- Storage -->
+    <details open style="grid-column: 1 / -1;">
+    <summary class="card" style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;user-select:none;"><svg style="flex-shrink:0;width:13px;height:13px;transition:transform .2s;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/></svg>
         Storage
         <span class="muted" style="margin-left:auto; font-weight:normal;" id="disk-summary"></span>
-      </h2>
-
+      </h2></summary>
+    <div class="card" style="margin-top:6px;">
       <!-- Drive status bar -->
       <div id="disk-drive-bar" class="drive-bar">
         <div class="seg seg-archive" id="disk-seg-archive"
@@ -1859,12 +2018,15 @@ INDEX_HTML = r"""
       <div id="disk-performers" style="margin-top:10px;"></div>
     </div>
 
+    </div></details>
     <!-- Downloaded videos -->
-    <div class="card" style="grid-column: 1 / -1;">
+    <details open style="grid-column: 1 / -1;">
+    <summary class="card" style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;user-select:none;"><svg style="flex-shrink:0;width:13px;height:13px;transition:transform .2s;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3"/></svg>
         Downloaded (<span id="hist-count">0</span>)
-      </h2>
+      </h2></summary>
+    <div class="card" style="margin-top:6px;">
       <div class="filter-row">
         <input id="hist-filter" type="text" placeholder="Search performer or title..." oninput="renderHistory()" style="min-width:240px;"/>
         <select id="hist-site" onchange="renderHistory()"><option value="">All sites</option></select>
@@ -1884,14 +2046,16 @@ INDEX_HTML = r"""
           <tbody id="hist-body"></tbody>
         </table>
       </div>
-    </div>
+    </div></details>
 
     <!-- Failed / skipped -->
-    <div class="card" style="grid-column: 1 / -1;">
+    <details open style="grid-column: 1 / -1;">
+    <summary class="card" style="display:flex;align-items:center;gap:8px;cursor:pointer;list-style:none;user-select:none;"><svg style="flex-shrink:0;width:13px;height:13px;transition:transform .2s;" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"/></svg>
       <h2>
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
         Failed / Skipped (<span id="fail-count">0</span>)
-      </h2>
+      </h2></summary>
+    <div class="card" style="margin-top:6px;">
       <div class="filter-row">
         <select id="fail-perm-filter" onchange="renderFailed()">
           <option value="">All</option>
@@ -1908,7 +2072,7 @@ INDEX_HTML = r"""
           <tbody id="fail-body"></tbody>
         </table>
       </div>
-    </div>
+    </div></details>
 
   </div>
 </section><!-- /page-archive -->
@@ -2260,6 +2424,12 @@ let _failed = {};
 let _auth = {};                     // cookie diagnostics
 let _selectedPerformer = null;
 let _siteCat = 'all';
+let _logLines = [];
+
+function _parseLogTime(line) {
+  const m = line.match(/^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})/);
+  return m ? new Date(m[1]).getTime() : 0;
+}
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 function toast(msg, type = '') {
@@ -2330,6 +2500,66 @@ async function apiPostOk(path, body) {
 }
 
 // ── Status + live log ────────────────────────────────────────────────────
+function renderLog() {
+  const lv = document.getElementById('log-viewer');
+  if (!lv) return;
+  const autoScroll = document.getElementById('log-autoscroll') && document.getElementById('log-autoscroll').checked;
+  const errOnly = document.getElementById('log-errors-only') && document.getElementById('log-errors-only').checked;
+  const mins = parseInt((document.getElementById('log-timeframe') || {}).value || '0');
+  const cutoff = mins > 0 ? Date.now() - mins * 60000 : 0;
+  const shouldScroll = autoScroll && (lv.scrollTop + lv.clientHeight >= lv.scrollHeight - 20);
+  let lines = _logLines;
+  if (cutoff) lines = lines.filter(l => _parseLogTime(l) >= cutoff || !_parseLogTime(l));
+  if (errOnly) lines = lines.filter(l => l.includes('ERROR') || l.includes('WARN'));
+  lv.innerHTML = lines.map(line => {
+    let cls = '';
+    if (line.includes('ERROR')) cls = 'ERROR';
+    else if (line.includes('WARN')) cls = 'WARN';
+    else if (line.includes('DEBUG')) cls = 'DEBUG';
+    return `<span class="${cls}">${escapeHtml(line)}</span>`;
+  }).join('\n');
+  if (shouldScroll) lv.scrollTop = lv.scrollHeight;
+}
+function copyLogErrors() {
+  const errors = _logLines.filter(l => l.includes('ERROR') || l.includes('WARN'));
+  if (!errors.length) { toast('No errors in log', 'info'); return; }
+  const text = errors.join('\n');
+  if (navigator.clipboard && window.isSecureContext) {
+    navigator.clipboard.writeText(text)
+      .then(() => toast(`Copied ${errors.length} error lines`, 'success'))
+      .catch(() => _showErrorsModal(text, errors.length));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text; ta.style.cssText = 'position:fixed;top:-9999px;left:-9999px;opacity:0;';
+    document.body.appendChild(ta); ta.select();
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch(_) {}
+    document.body.removeChild(ta);
+    if (ok) { toast(`Copied ${errors.length} error lines`, 'success'); }
+    else { _showErrorsModal(text, errors.length); }
+  }
+}
+function _showErrorsModal(text, count) {
+  const ov = document.createElement('div');
+  ov.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9998;display:flex;align-items:center;justify-content:center;';
+  const box = document.createElement('div');
+  box.style.cssText = 'background:var(--surface,#1e1e2e);border:1px solid var(--border,#333);border-radius:8px;padding:16px;width:82vw;max-width:960px;max-height:72vh;display:flex;flex-direction:column;gap:8px;z-index:9999;';
+  const hdr = document.createElement('div');
+  hdr.style.cssText = 'display:flex;align-items:center;justify-content:space-between;flex-shrink:0;';
+  hdr.innerHTML = `<span style="font-weight:600;font-size:13px;">Error lines (${count}) — Ctrl+A then Ctrl+C</span>`;
+  const btn = document.createElement('button');
+  btn.className = 'xs danger'; btn.textContent = '✕ Close';
+  hdr.appendChild(btn); box.appendChild(hdr);
+  const ta = document.createElement('textarea');
+  ta.value = text; ta.readOnly = true;
+  ta.style.cssText = 'flex:1;min-height:260px;font-family:monospace;font-size:11px;background:var(--bg,#11111b);color:var(--text,#cdd6f4);border:1px solid var(--border,#333);padding:8px;resize:vertical;outline:none;';
+  box.appendChild(ta); ov.appendChild(box); document.body.appendChild(ov);
+  ta.focus(); ta.select();
+  const close = () => { try { document.body.removeChild(ov); } catch(_){} };
+  btn.onclick = close;
+  ov.addEventListener('click', e => { if (e.target === ov) close(); });
+}
+
 async function refreshStatus() {
   try {
     const s = await api('/api/status');
@@ -2367,22 +2597,13 @@ async function refreshStatus() {
     document.getElementById('start-btn').disabled = s.archive_running || s.running;
     document.getElementById('stop-btn').disabled = !(s.archive_running || s.running);
 
-    // Live log
-    const lv = document.getElementById('log-viewer');
-    const autoScroll = document.getElementById('log-autoscroll').checked;
-    const shouldScroll = autoScroll && (lv.scrollTop + lv.clientHeight >= lv.scrollHeight - 20);
-    lv.innerHTML = (s.log_tail || []).map(line => {
-      let cls = '';
-      if (line.includes('ERROR')) cls = 'ERROR';
-      else if (line.includes('WARN')) cls = 'WARN';
-      else if (line.includes('DEBUG')) cls = 'DEBUG';
-      return `<span class="${cls}">${escapeHtml(line)}</span>`;
-    }).join('\n');
-    if (shouldScroll || (autoScroll && s.running)) lv.scrollTop = lv.scrollHeight;
+    _logLines = s.log_tail || [];
+    renderLog();
   } catch (e) { console.error(e); }
 }
 
 // ── Progress ─────────────────────────────────────────────────────────────
+let _progressIdle = 0;
 async function refreshProgress() {
   try {
     const p = await api('/api/progress');
@@ -2392,9 +2613,15 @@ async function refreshProgress() {
     const active = p.active || [];
     const sess = p.session || {};
     if (!sess.running && active.length === 0) {
-      card.style.display = 'none';
+      // Don't hide on a single idle poll — _progress.json is rewritten constantly
+      // and a read can momentarily come back empty, which made the card flicker
+      // off and on (and disrupt the bulk-add form). Only hide after several
+      // consecutive idle polls (~3s); keep the last shown content until then.
+      _progressIdle += 1;
+      if (_progressIdle >= 4) card.style.display = 'none';
       return;
     }
+    _progressIdle = 0;
     card.style.display = 'block';
 
     // Session summary (top-right of the card header)
@@ -2513,7 +2740,7 @@ async function refreshProgress() {
       activeHtml = '<div class="dl-empty">Session starting – initializing scrapers…</div>';
     }
 
-    listEl.innerHTML = phaseHtml + hitsHtml + activeHtml;
+    listEl.innerHTML = phaseHtml + hitsHtml + '<div class="dl-rows">' + activeHtml + '</div>';
   } catch (e) { console.error('progress', e); }
 }
 
@@ -2563,11 +2790,14 @@ async function loadConfig() {
   g('cfg-max-parallel').value = _config.max_parallel_downloads || '';
   g('cfg-aria2c-conn').value = _config.aria2c_connections || '';
   g('cfg-min-disk').value = _config.min_disk_gb || '';
+  g('cfg-min-size').value = _config.min_video_size_mb !== undefined ? _config.min_video_size_mb : '';
   g('cfg-min-dur').value = _config.min_duration_seconds || '';
   g('cfg-rate').value = _config.rate_limit || '';
   g('cfg-cookies').value = _config.cookies_file || '';
   g('cfg-imp').value = _config.impersonate_target || '';
   g('cfg-proxy').value = _config.download_proxy || '';
+  g('cfg-tor-startup').checked = !!_config.start_tor_on_startup;
+  g('cfg-download-images').checked = !!_config.download_images;
   g('cfg-cs-user').value = _config.camsmut_username || '';
   g('cfg-cs-pass').value = _config.camsmut_password || '';
   // Live recording settings
@@ -2836,18 +3066,103 @@ async function resetHistoryFor(name) {
 }
 
 // ── Performers ───────────────────────────────────────────────────────────
+
+function syncPerformersHeight() {
+  const perf = document.getElementById('performers-card');
+  const sets = document.getElementById('settings-card');
+  if (!perf || !sets) return;
+  const h = sets.offsetHeight;
+  if (h > 100) perf.style.maxHeight = h + 'px';
+}
+const PERF_IMG_EXTS = ['.jpg','.jpeg','.png','.gif','.webp','.bmp','.avif'];
+let _perfPrefLoaded = false;
+let _runs = {};
+async function loadRuns() {
+  try { _runs = await api('/api/runs') || {}; } catch(e) { _runs = _runs || {}; }
+  renderPerformers();
+}
+function _fmtRunDate(ts) {
+  const m = (ts || '').match(/^(\d{4})-(\d{2})-(\d{2})/);
+  return m ? `${m[3]}/${m[2]}/${m[1]}` : (ts || '');
+}
+function _fmtRunMeta(name) {
+  const r = _runs[name.toLowerCase()];
+  if (!r || !r.runs) return '<span class="pmeta none">No runs logged</span>';
+  const res = r.last_done
+    ? ` · <span class="ok">${r.ok} ok</span> <span class="fail">${r.failed} fail</span> <span class="skip">${r.skipped} skip</span>`
+    : '';
+  const times = r.runs > 1 ? ` · ${r.runs} runs` : '';
+  return `<span class="pmeta">last run ${_fmtRunDate(r.last_run)}${res}${times}</span>`;
+}
+function _perfCounts(name) {
+  const entries = _history[name.toLowerCase()] || {};
+  let videos = 0, images = 0;
+  for (const info of Object.values(entries)) {
+    const out = (info.output || '').toLowerCase();
+    const dot = out.lastIndexOf('.');
+    const ext = dot >= 0 ? out.slice(dot) : '';
+    if (PERF_IMG_EXTS.includes(ext)) images++; else videos++;
+  }
+  return {videos, images, total: videos + images, ran: Object.keys(entries).length > 0};
+}
+function _perfPrefSave() {
+  try {
+    const s = document.getElementById('perf-sort');
+    const f = document.getElementById('perf-filter');
+    if (s) localStorage.setItem('perfSort', s.value);
+    if (f) localStorage.setItem('perfFilter', f.value);
+  } catch(e){}
+}
 function renderPerformers() {
   const list = document.getElementById('perf-list');
-  const perfs = _config.performers || [];
+  const searchEl = document.getElementById('perf-search');
+  const sortEl = document.getElementById('perf-sort');
+  const filterEl = document.getElementById('perf-filter');
+  if (!_perfPrefLoaded && (sortEl || filterEl)) {
+    try {
+      if (sortEl) sortEl.value = localStorage.getItem('perfSort') || 'name';
+      if (filterEl) filterEl.value = localStorage.getItem('perfFilter') || 'all';
+    } catch(e){}
+    _perfPrefLoaded = true;
+  }
+  const search = (searchEl ? searchEl.value : '').trim().toLowerCase();
+  const sortMode = sortEl ? sortEl.value : 'name';
+  const filterMode = filterEl ? filterEl.value : 'all';
+  let perfs = (_config.performers || []).map(p => {
+    const r = _runs[p.toLowerCase()] || {};
+    return Object.assign({name: p, runCount: r.runs || 0, lastRun: r.last_run || ''}, _perfCounts(p));
+  });
+  perfs = perfs.filter(o => {
+    if (search && !o.name.toLowerCase().includes(search)) return false;
+    switch (filterMode) {
+      case 'has-videos': return o.videos > 0;
+      case 'no-videos':  return o.videos === 0;
+      case 'never-run':  return o.runCount === 0;
+      case 'has-images': return o.images > 0;
+      default: return true;
+    }
+  });
+  const _byName = (a,b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+  const _sorters = {
+    'name': _byName,
+    'videos-desc': (a,b) => (b.videos - a.videos) || _byName(a,b),
+    'videos-asc':  (a,b) => (a.videos - b.videos) || _byName(a,b),
+    'images-desc': (a,b) => (b.images - a.images) || _byName(a,b),
+    'total-desc':  (a,b) => (b.total - a.total) || _byName(a,b),
+    'lastrun-desc': (a,b) => (b.lastRun || '').localeCompare(a.lastRun || '') || _byName(a,b),
+    'lastrun-asc':  (a,b) => { if (!a.lastRun) return 1; if (!b.lastRun) return -1; return a.lastRun.localeCompare(b.lastRun) || _byName(a,b); },
+    'runs-desc':   (a,b) => (b.runCount - a.runCount) || _byName(a,b),
+  };
+  perfs.sort(_sorters[sortMode] || _byName);
   if (!perfs.length) {
-    list.innerHTML = '<div class="muted" style="padding:16px; text-align:center;">No performers. Add a username above.</div>';
+    list.innerHTML = '<div class="muted" style="padding:16px; text-align:center;">No performers match.</div>';
   } else {
-    list.innerHTML = perfs.map(p => {
-      const hist_count = Object.keys(_history[p.toLowerCase()] || {}).length;
+    list.innerHTML = perfs.map(o => {
+      const p = o.name;
       const isSel = (p === _selectedPerformer);
       return `<div class="perf-row ${isSel ? 'selected' : ''}" onclick="togglePerf('${escapeHtml(p)}')">
-        <span class="name">${escapeHtml(p)}</span>
-        <span class="count">${hist_count} videos</span>
+        <div class="pinfo"><span class="name">${escapeHtml(p)}</span>${_fmtRunMeta(p)}</div>
+        <span class="count">${o.videos} videos</span>${o.images ? `<span class="imgcount">${o.images} img</span>` : ''}
         <button class="xs" onclick="runSingleByName('${escapeHtml(p)}'); event.stopPropagation()" data-tip="Run just this one">▶</button>
         <button class="xs" onclick="resetHistoryFor('${escapeHtml(p)}'); event.stopPropagation()"
                 data-tip="Reset history so next run re-downloads everything" aria-label="Reset history">
@@ -2857,12 +3172,37 @@ function renderPerformers() {
       </div>`;
     }).join('');
   }
-  document.getElementById('stat-perf').textContent = perfs.length;
+  document.getElementById('stat-perf').textContent = (_config.performers || []).length;
 }
 function togglePerf(name) {
   _selectedPerformer = (_selectedPerformer === name) ? null : name;
   renderPerformers();
 }
+function renderQueue(queue) {
+  const box = document.getElementById('run-queue-box');
+  const list = document.getElementById('run-queue-list');
+  if (box && list) {
+    if (!queue.length) { box.style.display='none'; }
+    else {
+      box.style.display='';
+      list.innerHTML = queue.map((p,i)=>`<div style="display:flex;align-items:center;gap:6px;padding:2px 0;font-size:12px;"><span style="color:var(--muted);">${i+1}.</span><span>${escapeHtml(p)}</span><button class="xs danger" style="margin-left:auto;" onclick="removeFromQueue(${i})">&#x2715;</button></div>`).join('');
+    }
+  }
+  const sl = document.getElementById('queue-settings-list');
+  if (!sl) return;
+  if (!queue.length) { sl.innerHTML='<div class="muted" style="font-size:12px;padding:6px 0;">No performers queued.</div>'; return; }
+  sl.innerHTML = queue.map((p,i)=>`<div class="queue-item" draggable="true" data-idx="${i}" ondragstart="_qDs(event)" ondragover="_qDo(event)" ondrop="_qDp(event)"><span class="q-num">${i+1}</span><span class="q-name">${escapeHtml(p)}</span><button class="xs" onclick="_qUp(${i})" ${i===0?'disabled':''}>&#x25B2;</button><button class="xs" onclick="_qDn(${i})" ${i===queue.length-1?'disabled':''}>&#x25BC;</button><button class="xs danger" onclick="removeFromQueue(${i})">&#x2715;</button></div>`).join('');
+}
+let _qDi=-1;
+function _qDs(e){_qDi=+e.currentTarget.dataset.idx;e.dataTransfer.effectAllowed='move';}
+function _qDo(e){e.preventDefault();e.dataTransfer.dropEffect='move';}
+async function _qDp(e){e.preventDefault();const to=+e.currentTarget.dataset.idx;if(_qDi<0||_qDi===to)return;const r=await api('/api/queue/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:_qDi,to})});renderQueue(r.queue||[]);_qDi=-1;}
+async function _qUp(i){if(i===0)return;const r=await api('/api/queue/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:i,to:i-1})});renderQueue(r.queue||[]);}
+async function _qDn(i){const r=await api('/api/queue/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({from:i,to:i+1})});renderQueue(r.queue||[]);}
+async function clearQueue(){await api('/api/queue/clear',{method:'POST'});renderQueue([]);}
+async function removeFromQueue(idx){const r=await api('/api/queue/remove',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:idx})});renderQueue(r.queue||[]);}
+  api('/api/queue').then(r => renderQueue(r.queue || [])).catch(()=>{});
+  setTimeout(syncPerformersHeight, 50);
 async function addPerformer() {
   const name = document.getElementById('new-perf').value.trim();
   if (!name) return;
@@ -2979,11 +3319,14 @@ async function saveSettings() {
     max_parallel_downloads: parseInt(g('cfg-max-parallel').value) || 3,
     aria2c_connections: parseInt(g('cfg-aria2c-conn').value) || 16,
     min_disk_gb: parseFloat(g('cfg-min-disk').value) || 5.0,
+    min_video_size_mb: parseFloat(g('cfg-min-size').value) || 0,
     min_duration_seconds: parseFloat(g('cfg-min-dur').value) || 30.0,
     rate_limit: g('cfg-rate').value,
     cookies_file: g('cfg-cookies').value,
     impersonate_target: g('cfg-imp').value,
     download_proxy: g('cfg-proxy').value,
+    start_tor_on_startup: g('cfg-tor-startup').checked,
+    download_images: g('cfg-download-images').checked,
     camsmut_username: g('cfg-cs-user').value,
     camsmut_password: g('cfg-cs-pass').value,
     // Live settings: preserved as-is (edited via the Live tab's gear modal,
@@ -3226,7 +3569,7 @@ function closePreview(e) {
 
 // ── Run / stop ───────────────────────────────────────────────────────────
 async function startDownload() {
-  const perfs = _config.performers || [];
+  const perfs = (_config.performers || []).slice().sort((a,b) => a.toLowerCase().localeCompare(b.toLowerCase()));
   if (!perfs.length) { toast('No performers configured', 'error'); return; }
   if (!await confirmDialog(
         `This will probe every enabled site for <b>${perfs.length}</b> performers and download any new videos found.`,
@@ -3245,11 +3588,16 @@ async function runSinglePerformer() {
 }
 async function runSingleByName(name) {
   try {
-    await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
+    const r = await api('/api/run', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({performer: name})});
-    toast('Started ' + name, 'success');
-    setTimeout(refreshStatus, 600);
-    setTimeout(refreshProgress, 600);
+    if (r && r.queued) {
+      toast(name + ' added to queue (position ' + r.position + ')', 'info');
+      api('/api/queue').then(q => renderQueue(q.queue || [])).catch(()=>{});
+    } else {
+      toast('Started ' + name, 'success');
+      setTimeout(refreshStatus, 600);
+      setTimeout(refreshProgress, 600);
+    }
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 async function stopDownload() {
@@ -3291,7 +3639,7 @@ async function runDedup() {
   } catch(e) { toast('Error: ' + e.message, 'error'); }
 }
 async function refreshAll() {
-  await Promise.all([loadSites(), loadAuth(), loadConfig(), loadHistory(),
+  await Promise.all([loadSites(), loadAuth(), loadConfig(), loadHistory(), loadRuns(),
                      refreshStatus(), refreshProgress(), loadDisk(true)]);
   toast('Refreshed');
 }
@@ -4428,12 +4776,14 @@ document.addEventListener('keydown', (e) => {
   await loadAuth();
   await loadConfig();
   await loadHistory();
+  await loadRuns();
   await refreshStatus();
   await refreshProgress();
   await loadDisk();
   setInterval(refreshStatus, 2000);
   setInterval(refreshProgress, 700);   // fast cadence for progress bar
   setInterval(loadHistory, 15000);
+  setInterval(loadRuns, 30000);
   setInterval(loadAuth, 30000);
   setInterval(loadDisk, 20000);        // disk snapshot every 20s
   // Live polling – only every 3s and only when Live tab visible
@@ -4504,6 +4854,29 @@ _tail_thread = threading.Thread(target=_tail_log, daemon=True)
 _tail_thread.start()
 
 
+def _start_next_queued():
+    """Pop the next performer from _run_queue and start it. No-op if queue empty or already running."""
+    global _runner_thread, _run_queue
+    with _state_lock:
+        if _state["running"] or not _run_queue:
+            return
+        performer = _run_queue.pop(0)
+        cmd = [sys.executable, str(SCRIPT_DIR / "universal_downloader.py")]
+        cmd.append(performer if performer else "--all")
+        try:
+            proc = subprocess.Popen(
+                cmd, cwd=str(SCRIPT_DIR),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
+            )
+            _state["running"] = True
+            _state["pid"] = proc.pid
+            _state["started_at"] = datetime.now().isoformat()
+            _state["current_performer"] = performer or "(all)"
+            _runner_thread = proc
+        except Exception:
+            pass
+
 def _monitor_subprocess():
     """Monitor the download subprocess and update _state when done."""
     global _runner_thread
@@ -4516,10 +4889,133 @@ def _monitor_subprocess():
                 _state["running"] = False
                 _state["pid"] = None
                 _runner_thread = None
+            _clear_stale_progress()
+            # Start next queued performer if any
+            _start_next_queued()
         time.sleep(0.5)
 
 
 threading.Thread(target=_monitor_subprocess, daemon=True).start()
+
+
+# -- Per-performer run history (parsed from universal.log) --------------------
+# universal.log is the only record that a scrape ran regardless of result
+# (history.json holds successes only). Two markers per run:
+#   "Probing N URL patterns across M sites for 'NAME'"  -> a run started
+#   "'NAME' done: X OK, Y failed, Z skipped"            -> run results
+# Parsing is incremental and cached to _runs_cache.json (parsed dict + byte
+# offset) so each launch only reads the newly-appended tail of the log.
+RUNS_CACHE_PATH = DOWNLOADS_DIR / "_runs_cache.json"
+_runs_data = {"offset": 0, "performers": {}}
+_runs_lock = threading.Lock()
+_RUNS_PROBE_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*Probing \d+ URL patterns across \d+ sites for '(.+?)'"
+)
+_RUNS_DONE_RE = re.compile(
+    r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d).*'(.+?)' done: (\d+) OK, (\d+) failed, (\d+) skipped"
+)
+
+
+def _runs_blank(name):
+    return {"name": name, "runs": 0, "first_run": "", "last_run": "",
+            "ok": 0, "failed": 0, "skipped": 0, "last_done": ""}
+
+
+def _runs_apply_line(perfs, line):
+    m = _RUNS_PROBE_RE.match(line)
+    if m:
+        ts, name = m.group(1), m.group(2)
+        rec = perfs.setdefault(name.lower(), _runs_blank(name))
+        rec["name"] = name
+        rec["runs"] += 1
+        if not rec["first_run"] or ts < rec["first_run"]:
+            rec["first_run"] = ts
+        if ts > rec["last_run"]:
+            rec["last_run"] = ts
+        return
+    m = _RUNS_DONE_RE.match(line)
+    if m:
+        ts, name, ok, failed, skipped = m.groups()
+        rec = perfs.setdefault(name.lower(), _runs_blank(name))
+        rec["name"] = name
+        if ts >= rec["last_done"]:
+            rec["last_done"] = ts
+            rec["ok"], rec["failed"], rec["skipped"] = int(ok), int(failed), int(skipped)
+
+
+def _runs_load_cache():
+    global _runs_data
+    try:
+        if RUNS_CACHE_PATH.exists():
+            with open(RUNS_CACHE_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict) and isinstance(data.get("performers"), dict):
+                _runs_data = {"offset": int(data.get("offset", 0)),
+                              "performers": data["performers"]}
+    except Exception:
+        _runs_data = {"offset": 0, "performers": {}}
+
+
+def _runs_save_cache():
+    try:
+        tmp = RUNS_CACHE_PATH.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(_runs_data, f)
+        os.replace(str(tmp), str(RUNS_CACHE_PATH))
+    except Exception:
+        pass
+
+
+def _runs_parse():
+    """Incrementally parse the newly-appended tail of universal.log."""
+    global _runs_data
+    try:
+        if not LOG_PATH.exists():
+            return
+        size = LOG_PATH.stat().st_size
+        with _runs_lock:
+            offset = _runs_data.get("offset", 0)
+            perfs = dict(_runs_data.get("performers", {}))
+        if size < offset:          # log truncated/replaced -> full reparse
+            offset, perfs = 0, {}
+        if size <= offset:
+            return
+        with open(LOG_PATH, "rb") as f:
+            f.seek(offset)
+            chunk = f.read(size - offset)
+        if not chunk:
+            return
+        if chunk.endswith(b"\n"):
+            body, new_offset = chunk, offset + len(chunk)
+        else:                       # don't consume a partial trailing line
+            idx = chunk.rfind(b"\n")
+            if idx == -1:
+                return
+            body, new_offset = chunk[:idx + 1], offset + idx + 1
+        for raw in body.split(b"\n"):
+            if raw:
+                _runs_apply_line(perfs, raw.decode("utf-8", "replace"))
+        with _runs_lock:
+            _runs_data = {"offset": new_offset, "performers": perfs}
+        _runs_save_cache()
+    except Exception:
+        pass
+
+
+def _runs_worker():
+    _runs_load_cache()
+    while True:
+        _runs_parse()
+        time.sleep(60)
+
+
+threading.Thread(target=_runs_worker, daemon=True, name="runs-parser").start()
+
+
+@app.route("/api/runs")
+def api_runs():
+    with _runs_lock:
+        return jsonify(dict(_runs_data.get("performers", {})))
 
 
 # ── API routes ───────────────────────────────────────────────────────────────
@@ -5108,7 +5604,9 @@ def api_run():
     with _mode_lock:
         with _state_lock:
             if _state["running"]:
-                return jsonify({"error": "already running"}), 400
+                performer = (request.get_json(silent=True) or {}).get("performer")
+                _run_queue.append(performer)
+                return jsonify({"queued": True, "position": len(_run_queue), "performer": performer or "(all)"}), 202
 
         # Stop any active Live bots first (mutual exclusion).
         live_stopped = _stop_all_live_bots()
@@ -5143,6 +5641,35 @@ def api_run():
             _runner_thread = proc
     return jsonify({"ok": True, "pid": proc.pid, "live_stopped": live_stopped})
 
+
+@app.route("/api/queue", methods=["GET"])
+def api_queue_get():
+    return jsonify({"queue": [p or "(all)" for p in _run_queue]})
+
+@app.route("/api/queue/clear", methods=["POST"])
+def api_queue_clear():
+    global _run_queue
+    _run_queue.clear()
+    return jsonify({"ok": True})
+
+@app.route("/api/queue/remove", methods=["POST"])
+def api_queue_remove():
+    global _run_queue
+    idx = (request.get_json(silent=True) or {}).get("index", -1)
+    if 0 <= idx < len(_run_queue):
+        _run_queue.pop(idx)
+    return jsonify({"ok": True, "queue": [p or "(all)" for p in _run_queue]})
+
+@app.route("/api/queue/reorder", methods=["POST"])
+def api_queue_reorder():
+    global _run_queue
+    body = request.get_json(silent=True) or {}
+    frm = int(body.get("from", -1))
+    to  = int(body.get("to", -1))
+    if 0 <= frm < len(_run_queue) and 0 <= to < len(_run_queue) and frm != to:
+        item = _run_queue.pop(frm)
+        _run_queue.insert(to, item)
+    return jsonify({"ok": True, "queue": [p or "(all)" for p in _run_queue]})
 
 @app.route("/api/stop", methods=["POST"])
 def api_stop():
@@ -5581,6 +6108,7 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=7860)
+    ap.add_argument("--config", default=None, help="Path to config.json")
     args = ap.parse_args()
     # Force UTF-8 output on Windows cp1252 consoles
     try:

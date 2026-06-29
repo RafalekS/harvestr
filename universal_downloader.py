@@ -169,6 +169,7 @@ console = Console() if HAVE_RICH else None
 # ── aria2c auto-detection ─────────────────────────────────────────────────────
 ARIA2C_PATH = ""
 for _candidate in [
+    r"C:\Users\r_sta\AppData\Local\Microsoft\WinGet\Links\aria2c.exe",
     r"C:\Users\Street Coder\AppData\Local\Microsoft\WinGet\Packages\aria2.aria2_Microsoft.Winget.Source_8wekyb3d8bbwe\aria2-1.37.0-win-64bit-build1\aria2c.exe",
     r"C:\ProgramData\chocolatey\bin\aria2c.exe",
     shutil.which("aria2c") or "aria2c",
@@ -316,6 +317,7 @@ class UniversalConfig:
     cookies_file: str = ""                                    # Netscape cookies.txt path
     impersonate_target: str = "chrome"                         # curl_cffi impersonation
     min_duration_seconds: float = 30.0                         # skip very short clips
+    min_video_size_mb: float = 0.0                             # skip files smaller than N MB (0 = disabled)
     retries: int = 5
     probe_timeout: int = 30
     verbose: bool = False
@@ -336,6 +338,7 @@ class UniversalConfig:
     # unless the user explicitly runs the corresponding /api/disk endpoint.
     max_per_performer_gb: float = 0.0
     auto_prune_days: int = 0
+    download_images: bool = False   # also download image posts (fapello etc.)
 
     @classmethod
     def load(cls, path: Path) -> "UniversalConfig":
@@ -751,7 +754,7 @@ class YtdlpEngine:
             from yt_dlp.utils import match_filter_func
             # "?" marks field as optional — videos with unknown duration pass
             opts["match_filter"] = match_filter_func(
-                f"duration >=? {self.config.min_duration_seconds}"
+                f"duration >= {self.config.min_duration_seconds}"
             )
         # aria2c external downloader — best for direct HTTP (mp4).
         # Let yt-dlp handle HLS/DASH natively with concurrent fragments.
@@ -851,7 +854,12 @@ class UniversalDownloader:
         self.custom_scrapers: List[_CustomSiteScraper] = _load_custom_scrapers(
             log, enabled_names=enabled, cookies_file=config.cookies_file,
             site_credentials=site_credentials,
+            proxy=config.download_proxy,
         )
+        # Push image-download flag into the Fapello scraper instance
+        for _sc in self.custom_scrapers:
+            if _sc.NAME == "fapello":
+                _sc.download_images = config.download_images
 
     def check_disk_space(self) -> bool:
         try:
@@ -1399,13 +1407,17 @@ class UniversalDownloader:
                 stdout = (r.stdout.decode(errors="replace") if r.stdout else "")
                 tail = (stderr or stdout)[-400:].replace("\n", " | ")
                 size = out_path.stat().st_size if out_path.exists() else 0
-                self.log.debug(
-                    f"aria2c exit={rc} size={size} url={v.stream_url[:80]}... "
-                    f"msg={tail}"
+                self.log.info(
+                    f"  aria2c fail: {v.site}/{v.video_id} exit={rc} size={size} "
+                    f"msg={tail[:200]}"
                 )
+            elif not ok:
+                # Streaming mode — no stderr captured, just log the exit code
+                size = out_path.stat().st_size if out_path.exists() else 0
+                self.log.info(f"  aria2c fail: {v.site}/{v.video_id} exit={rc} size={size}")
             return ok
         except subprocess.TimeoutExpired:
-            self.log.debug(f"aria2c timeout: {v.site}/{v.video_id}")
+            self.log.info(f"  aria2c timeout: {v.site}/{v.video_id}")
             return False
         except Exception as e:
             self.log.debug(f"aria2c error: {e}")
@@ -1477,7 +1489,11 @@ class UniversalDownloader:
                         or "failed to connect" in stderr.lower() \
                         or "could not resolve host" in stderr.lower():
                     self._last_mp4_error = "network"
-                self.log.debug(f"curl exit={rc} size={out_path.stat().st_size if out_path.exists() else 0} msg={stderr[-200:]}")
+                size = out_path.stat().st_size if out_path.exists() else 0
+                self.log.info(
+                    f"  curl fail: {v.site}/{v.video_id} exit={rc} size={size} "
+                    f"msg={stderr[-200:].replace(chr(10), ' | ')}"
+                )
             return ok
         except Exception as e:
             self.log.debug(f"curl error: {e}")
@@ -1579,7 +1595,13 @@ class UniversalDownloader:
         perf_dir = self.output_dir / v.performer
         perf_dir.mkdir(parents=True, exist_ok=True)
         safe_title = self._sanitize_filename(v.title or v.video_id)
-        out_path = perf_dir / f"{v.site}-{v.video_id}-{safe_title}.mp4"
+        _img_ext = v.stream_kind if v.stream_kind in ('jpg', 'jpeg', 'png', 'webp') else None
+        if _img_ext:
+            img_dir = perf_dir / 'images'
+            img_dir.mkdir(parents=True, exist_ok=True)
+            out_path = img_dir / f"{v.site}-{v.video_id}-{safe_title}.{_img_ext}"
+        else:
+            out_path = perf_dir / f"{v.site}-{v.video_id}-{safe_title}.mp4"
 
         # Download — wrap with progress tracking so the UI can show a live bar.
         backend = "ffmpeg" if v.stream_kind == "hls" else ("aria2c" if ARIA2C_PATH else "curl")
@@ -1626,11 +1648,15 @@ class UniversalDownloader:
             return ("fail", v, None)
 
         filesize = out_path.stat().st_size
-        if filesize < 100_000:
+        min_size_bytes = max(100_000, int(self.config.min_video_size_mb * 1024 * 1024))
+        if filesize < min_size_bytes and _img_ext is None:
+            size_mb = filesize / (1024 * 1024)
             self.failed.record_failure(v, "file too small", filesize)
-            self.log.warning(f"  SKIP: {v.site}/{v.video_id} too small ({filesize} bytes)")
-            try: out_path.unlink()
-            except Exception: pass
+            self.log.warning(f"  SKIP: {v.site}/{v.video_id} too small ({size_mb:.1f} MB < {min_size_bytes // (1024*1024) or 0.1:.0f} MB)")
+            try:
+                out_path.unlink()
+            except Exception as _e:
+                self.log.warning(f"  WARN: could not delete {out_path.name}: {_e}")
             return ("skip", v, None)
 
         self.history.mark_downloaded(v, output_path=str(out_path), filesize=filesize)
@@ -1646,6 +1672,15 @@ class UniversalDownloader:
             if not self.check_disk_space():
                 self.log.error("Disk full — aborting downloads.")
                 return None
+            # Duration pre-filter (applies to both custom and yt-dlp paths)
+            min_dur = self.config.min_duration_seconds
+            if min_dur and v.duration > 0 and v.duration < min_dur:
+                self.log.info(
+                    f"  SKIP (too short {v.duration:.0f}s < {min_dur:.0f}s): "
+                    f"{v.site}/{v.video_id}: {(v.title or '')[:60]}"
+                )
+                return ("skip", v, None)
+
             # Custom-scraper videos use their own download path
             if v.is_custom:
                 return self._download_custom_video(v)
@@ -1705,6 +1740,17 @@ class UniversalDownloader:
                     reason = "filtered out (duration/condition)"
                 self.failed.record_failure(v, reason, filesize)
                 self.log.warning(f"  SKIP: {v.site}/{v.video_id} ({reason}): {v.title[:60]}")
+                return ("skip", v, None)
+            min_mb = self.config.min_video_size_mb
+            if min_mb and filesize < min_mb * 1024 * 1024:
+                size_mb = filesize / (1024 * 1024)
+                if output and Path(output).exists():
+                    try:
+                        Path(output).unlink()
+                    except Exception as _e:
+                        self.log.warning(f"  WARN: could not delete {Path(output).name}: {_e}")
+                self.failed.record_failure(v, f"file too small ({size_mb:.1f} MB)", filesize)
+                self.log.warning(f"  SKIP: {v.site}/{v.video_id} too small ({size_mb:.1f} MB < {min_mb:.0f} MB): {v.title[:60]}")
                 return ("skip", v, None)
 
             self.history.mark_downloaded(v, output_path=output, filesize=filesize)
@@ -2002,6 +2048,7 @@ def main() -> int:
             f"  Output     : {cfg.output_dir}\n"
             f"  Performers : {len(cfg.performers)} in config\n"
             f"  Concurrency: probe={cfg.max_parallel_probes} dl={cfg.max_parallel_downloads}\n"
+            f"  Min size   : {cfg.min_video_size_mb:.0f} MB\n"
             f"  History    : {DownloadHistory(Path(cfg.output_dir) / 'history.json').count()} downloaded",
         ))
 

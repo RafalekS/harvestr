@@ -291,6 +291,25 @@
       "yt_dlp_extractor": "youjizz",
       "supports_flat": true,
       "notes": "Old-school tube; supports both /profile/ and /pornstars/ URL forms."
+    },
+
+    "viralxxxporn": {
+    "category": "adult",
+    "patterns": [
+      "https://viralxxxporn.com/search/altgirlhotgirl/{u}"
+    ],
+    "yt_dlp_extractor": "generic",
+    "supports_flat": false,
+    "notes": "Search-results page listing. No dedicated yt-dlp extractor; generic fallback."
+  },
+    "pornhd3x": {
+      "category": "adult",
+      "patterns": [
+        "https://www.pornhd3x.tv/studio/{u}"
+      ],
+      "yt_dlp_extractor": "generic",
+      "supports_flat": false,
+      "notes": "No yt-dlp extractor. Studio pages work with plain requests; pornstar pages are Cloudflare-blocked. Username = studio slug (e.g. 'vixen'). Custom scraper: PornHD3X in custom_scrapers.py."
     }
   }
 }
