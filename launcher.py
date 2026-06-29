@@ -2,6 +2,7 @@
 """Harvestr server launcher GUI."""
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 from pathlib import Path
@@ -227,7 +228,7 @@ class LauncherWindow(QMainWindow):
         self._persist_settings()
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
             self._append_log("[launcher] Stopping server before exit…")
-            self._process.kill()
+            self._kill_tree()
             self._process.waitForFinished(3000)
         event.accept()
 
@@ -286,18 +287,38 @@ class LauncherWindow(QMainWindow):
         self.status.set_running(self._url())
         self._set_running_state(True)
 
+    def _kill_tree(self):
+        """Kill webui AND everything it spawned (downloaders, tor). QProcess.kill()
+        only kills webui itself, orphaning its children; taskkill /T kills the
+        whole process tree by PID."""
+        proc = self._process
+        if not proc:
+            return
+        pid = int(proc.processId())
+        if pid > 0 and sys.platform == "win32":
+            try:
+                subprocess.run(
+                    ["taskkill", "/T", "/F", "/PID", str(pid)],
+                    capture_output=True,
+                    creationflags=subprocess.CREATE_NO_WINDOW,
+                )
+                return
+            except Exception as e:
+                self._append_log(f"[launcher] taskkill error: {e}")
+        proc.kill()  # fallback: non-Windows, or taskkill unavailable/failed
+
     def _stop(self):
         if not self._process or self._process.state() == QProcess.ProcessState.NotRunning:
             self._append_log("[launcher] Server is not running.")
             return
         self._append_log("[launcher] Stopping server…")
-        self._process.kill()
+        self._kill_tree()
 
     def _restart(self):
         if self._process and self._process.state() != QProcess.ProcessState.NotRunning:
             self._restart_pending = True
             self._append_log("[launcher] Restarting server…")
-            self._process.kill()
+            self._kill_tree()
         else:
             self._do_start()
 
