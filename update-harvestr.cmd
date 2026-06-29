@@ -14,15 +14,8 @@ if errorlevel 1 (
 )
 
 echo.
-REM Deps (yt-dlp, flask, etc.) live in the venv that runs webui.py + the downloader.
-REM The launcher GUI uses global Python (PyQt6) and is not covered by requirements.txt.
-if exist "venv\Scripts\python.exe" (
-    echo Updating dependencies in venv...
-    "venv\Scripts\python.exe" -m pip install -r requirements.txt
-) else (
-    echo Updating dependencies (global Python)...
-    python -m pip install -r requirements.txt
-)
+echo Updating dependencies (global Python)...
+python -m pip install -r requirements.txt
 
 echo.
 echo Update complete.
