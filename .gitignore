@@ -90,3 +90,6 @@ claude_*.md
 *.notes.md
 .memory/
 .claude/
+
+# Launcher GUI settings (host/port/config/geometry) — written at runtime, machine-local
+_launcher_settings.json
