@@ -18,7 +18,6 @@ from PyQt6.QtWidgets import (
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 WEBUI_SCRIPT = SCRIPT_DIR / "webui.py"
-VENV_PYTHON = SCRIPT_DIR / "venv" / "Scripts" / "python.exe"
 SETTINGS_FILE = SCRIPT_DIR / "_launcher_settings.json"
 
 DEFAULT_HOST = "127.0.0.1"
@@ -255,8 +254,9 @@ class LauncherWindow(QMainWindow):
         self._set_running_state(False)
 
         proc = QProcess(self)
-        venv_py = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
-        proc.setProgram(venv_py)
+        # Run webui (and the downloader/tor it spawns) on the same Python that runs
+        # this launcher — the global interpreter. No venv.
+        proc.setProgram(sys.executable)
         cfg_path = self._settings.get("config_path", "").strip()
         args_list = [str(WEBUI_SCRIPT), "--host", self._host(), "--port", str(self._port())]
         if cfg_path:
