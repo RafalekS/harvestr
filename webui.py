@@ -1842,6 +1842,9 @@ INDEX_HTML = r"""
             <button class="xs" onclick="enableTor()" data-tip="Auto-start embedded Tor and fill in SOCKS URL">Use Tor</button>
           </div>
         </td></tr>
+        <tr><td>Tor Browser path</td><td>
+          <input id="cfg-tor-path" type="text" placeholder="Full path to tor.exe — blank = auto-detect common install locations"/>
+        </td></tr>
         <tr><td>Auto-start Tor</td><td>
           <label style="display:flex; align-items:center; gap:6px; cursor:pointer;">
             <input id="cfg-tor-startup" type="checkbox"/>
@@ -2796,6 +2799,7 @@ async function loadConfig() {
   g('cfg-cookies').value = _config.cookies_file || '';
   g('cfg-imp').value = _config.impersonate_target || '';
   g('cfg-proxy').value = _config.download_proxy || '';
+  g('cfg-tor-path').value = _config.tor_path || '';
   g('cfg-tor-startup').checked = !!_config.start_tor_on_startup;
   g('cfg-download-images').checked = !!_config.download_images;
   g('cfg-cs-user').value = _config.camsmut_username || '';
@@ -3325,6 +3329,7 @@ async function saveSettings() {
     cookies_file: g('cfg-cookies').value,
     impersonate_target: g('cfg-imp').value,
     download_proxy: g('cfg-proxy').value,
+    tor_path: g('cfg-tor-path').value,
     start_tor_on_startup: g('cfg-tor-startup').checked,
     download_images: g('cfg-download-images').checked,
     camsmut_username: g('cfg-cs-user').value,

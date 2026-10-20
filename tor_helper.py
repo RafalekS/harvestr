@@ -15,6 +15,7 @@ config.download_proxy.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import socket
 import subprocess
@@ -25,6 +26,11 @@ from pathlib import Path
 SOCKS_PORT = 9055      # custom, avoids clashing with default 9050/9150
 CONTROL_PORT = 9056
 
+# Fallback guesses only — any Tor Browser install that isn't in one of these
+# exact spots (e.g. a custom folder under Desktop, a non-default drive) needs
+# "Tor Browser path" set in Settings (config.json's tor_path), checked first
+# in find_tor() below. Don't add more user-specific guesses here; config.json
+# is the real fix for "it's installed somewhere else" per-machine.
 CANDIDATE_PATHS = [
     r"C:\Users\{user}\Desktop\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
     r"C:\Users\{user}\AppData\Local\Tor Browser\Browser\TorBrowser\Tor\tor.exe",
@@ -33,9 +39,26 @@ CANDIDATE_PATHS = [
     r"C:\Tor\tor.exe",
 ]
 DATA_DIR = Path(__file__).resolve().parent / "_tor_data"
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+
+
+def _configured_tor_path() -> str | None:
+    """Read tor_path from config.json (Settings → "Tor Browser path") if set.
+    Standalone read, not an import of webui.py, so this script stays runnable
+    on its own — same reasoning CONFIG_PATH already follows in webui.py."""
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    path = (cfg.get("tor_path") or "").strip()
+    return path or None
 
 
 def find_tor() -> str | None:
+    configured = _configured_tor_path()
+    if configured and Path(configured).is_file():
+        return configured
+
     user = os.environ.get("USERNAME", "")
     for p in CANDIDATE_PATHS:
         resolved = p.format(user=user)
@@ -154,7 +177,9 @@ def main() -> int:
     else:
         tor_exe = find_tor()
         if not tor_exe:
-            print("ERROR: tor.exe not found. Install Tor Browser from "
+            print("ERROR: tor.exe not found. If Tor Browser is installed somewhere "
+                  "other than the common locations this checks, set its exact path "
+                  "under Settings -> \"Tor Browser path\". Otherwise install it from "
                   "https://www.torproject.org/download/ "
                   "or run: winget install TorProject.TorBrowser",
                   file=sys.stderr)
