@@ -35,6 +35,7 @@ import logging
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
@@ -72,8 +73,16 @@ class SiteHealth:
             self._data = {"sites": {}, "updated_at": _now_iso()}
 
     def _flush(self) -> None:
-        """Atomic-rename write with Windows-lock retry."""
+        """Atomic-rename write with Windows-lock retry.
+
+        os.replace() can raise PermissionError on Windows/SMB if webui.py's
+        /api/site-health is reading self.path at that exact moment. Retries
+        a few times with a short backoff before giving up, and always
+        removes the temp file on failure — previously a failed replace left
+        the mkstemp file orphaned forever (hundreds of stray
+        ._site_health.*.tmp files on an SMB share under contention)."""
         self._data["updated_at"] = _now_iso()
+        tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=str(self.path.parent),
@@ -81,10 +90,22 @@ class SiteHealth:
             )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, separators=(",", ":"))
-            os.replace(tmp, self.path)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, self.path)
+                    tmp = None
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
         except Exception:
             # Best-effort; drift detection should never block the downloader
             pass
+        finally:
+            if tmp is not None:
+                try: os.remove(tmp)
+                except OSError: pass
 
     # ── recording ────────────────────────────────────────────────────
 

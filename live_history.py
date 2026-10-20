@@ -24,6 +24,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -90,7 +91,12 @@ class LiveHistory:
             self._data = {"models": {}, "updated_at": _iso(_now())}
 
     def _flush(self) -> None:
+        """Atomic-rename write with Windows-lock retry. Always removes the
+        temp file on failure — an unhandled os.replace() error (e.g. the
+        webui process reading this file at the same moment on an SMB
+        share) used to leave the mkstemp file orphaned forever."""
         self._data["updated_at"] = _iso(_now())
+        tmp = None
         try:
             fd, tmp = tempfile.mkstemp(
                 dir=str(self.path.parent),
@@ -98,9 +104,21 @@ class LiveHistory:
             )
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(self._data, f, ensure_ascii=False, separators=(",", ":"))
-            os.replace(tmp, self.path)
+            for attempt in range(5):
+                try:
+                    os.replace(tmp, self.path)
+                    tmp = None
+                    break
+                except OSError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.2 * (attempt + 1))
         except Exception:
             pass
+        finally:
+            if tmp is not None:
+                try: os.remove(tmp)
+                except OSError: pass
 
     def _trim_old(self, entry: Dict[str, Any]) -> None:
         """Drop transitions older than KEEP_DAYS days."""
