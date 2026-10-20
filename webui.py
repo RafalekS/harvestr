@@ -63,6 +63,7 @@ def _get_downloads_dir() -> Path:
 DOWNLOADS_DIR = _get_downloads_dir()
 HISTORY_PATH = DOWNLOADS_DIR / "history.json"
 FAILED_PATH = DOWNLOADS_DIR / "failed.json"
+QUEUE_PATH = DOWNLOADS_DIR / "queue.json"
 LOG_PATH = DOWNLOADS_DIR / "universal.log"
 # Network settings (both gitignored — hold proxy credentials / rotation config):
 SITE_PROXIES_PATH = SCRIPT_DIR / "site_proxies.json"
@@ -125,7 +126,8 @@ _state = {
 }
 _state_lock = threading.Lock()
 _runner_thread: subprocess.Popen | None = None
-_run_queue: list = []   # performer names (or None=all) waiting to run
+_run_queue: list = []   # performer names (or None=all) waiting to run; reloaded from
+                        # QUEUE_PATH further down once load_json/save_json exist
 
 # ── Mutual-exclusion helpers (Live ⇄ Archive) ────────────────────────────────
 # Only one mode can be active at a time. Starting Archive stops all Live bots
@@ -427,6 +429,26 @@ def save_json(path: Path, data: dict) -> None:
         try: os.remove(tmp)
         except OSError: pass
         raise
+
+
+def _save_run_queue() -> None:
+    """Persist _run_queue to disk so a webui.py restart doesn't silently
+    drop queued performers (it used to be in-memory only)."""
+    try:
+        save_json(QUEUE_PATH, _run_queue)
+    except Exception:
+        pass
+
+
+def _load_run_queue() -> list:
+    try:
+        data = json.loads(QUEUE_PATH.read_text(encoding="utf-8"))
+        return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+_run_queue = _load_run_queue()
 
 
 def load_sites() -> list[str]:
@@ -4867,6 +4889,7 @@ def _start_next_queued():
         if _state["running"] or not _run_queue:
             return
         performer = _run_queue.pop(0)
+        _save_run_queue()
         cmd = [sys.executable, str(SCRIPT_DIR / "universal_downloader.py")]
         cmd.append(performer if performer else "--all")
         try:
@@ -5612,6 +5635,7 @@ def api_run():
             if _state["running"]:
                 performer = (request.get_json(silent=True) or {}).get("performer")
                 _run_queue.append(performer)
+                _save_run_queue()
                 return jsonify({"queued": True, "position": len(_run_queue), "performer": performer or "(all)"}), 202
 
         # Stop any active Live bots first (mutual exclusion).
@@ -5656,6 +5680,7 @@ def api_queue_get():
 def api_queue_clear():
     global _run_queue
     _run_queue.clear()
+    _save_run_queue()
     return jsonify({"ok": True})
 
 @app.route("/api/queue/remove", methods=["POST"])
@@ -5664,6 +5689,7 @@ def api_queue_remove():
     idx = (request.get_json(silent=True) or {}).get("index", -1)
     if 0 <= idx < len(_run_queue):
         _run_queue.pop(idx)
+        _save_run_queue()
     return jsonify({"ok": True, "queue": [p or "(all)" for p in _run_queue]})
 
 @app.route("/api/queue/reorder", methods=["POST"])
@@ -5675,6 +5701,7 @@ def api_queue_reorder():
     if 0 <= frm < len(_run_queue) and 0 <= to < len(_run_queue) and frm != to:
         item = _run_queue.pop(frm)
         _run_queue.insert(to, item)
+        _save_run_queue()
     return jsonify({"ok": True, "queue": [p or "(all)" for p in _run_queue]})
 
 @app.route("/api/stop", methods=["POST"])
