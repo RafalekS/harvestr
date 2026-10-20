@@ -219,7 +219,19 @@ def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
         console_handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
     console_handler.setLevel(logging.DEBUG if verbose else logging.INFO)
 
-    file_handler = logging.FileHandler(str(log_file), encoding="utf-8")
+    # Size-based rotation: universal.log is the only complete per-performer
+    # run record (see webui.py's _runs_parse docstring) and a plain
+    # logging.FileHandler here never rotated or purged it — it grew to 57MB+
+    # unbounded before this was added. Rotating to universal.log.1/.2/... at
+    # 20MB, keeping 5 backups (~100MB max total), matches the sibling
+    # archive-errors.log handler below in spirit. _runs_parse() in webui.py
+    # already handles a truncated/replaced universal.log correctly (detects
+    # size < offset -> full reparse), which is exactly what happens on
+    # rotation, so no change needed there.
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(
+        str(log_file), maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8",
+    )
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(logging.Formatter(
         "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
