@@ -451,6 +451,28 @@ def _load_run_queue() -> list:
 _run_queue = _load_run_queue()
 
 
+def _sweep_stale_tmp_files() -> None:
+    """Delete leftover ._*.tmp atomic-write temp files on startup.
+
+    These are only ever orphaned when a writer (webui.py or a downloader
+    subprocess) was hard-killed (taskkill /F) mid-flush, between mkstemp()
+    and os.replace() — a normal exception path already cleans up after
+    itself. By the time a new process starts, any such file's writer is
+    guaranteed dead, so it's always safe to remove. Confirmed real: user
+    reported hundreds of these accumulating on an SMB share."""
+    try:
+        for p in DOWNLOADS_DIR.glob("._*.tmp"):
+            try:
+                p.unlink()
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
+_sweep_stale_tmp_files()
+
+
 def load_sites() -> list[str]:
     """Return a simple list of all site names (yt-dlp + custom scrapers)."""
     return [s["name"] for s in load_sites_detailed()]
