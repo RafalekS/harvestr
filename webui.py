@@ -297,7 +297,8 @@ def _maybe_autostart_tor() -> None:
     def _start():
         try:
             r = _sp.run(
-                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--start"],
+                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--start",
+                 "--config", str(CONFIG_PATH)],
                 capture_output=True, text=True, timeout=150,
             )
             proxy = r.stdout.strip()
@@ -6038,14 +6039,16 @@ def api_tor():
     try:
         if action == "stop":
             r = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--stop"],
+                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--stop",
+                 "--config", str(CONFIG_PATH)],
                 capture_output=True, text=True, timeout=10,
             )
             return jsonify({"ok": True, "stopped": True, "stdout": (r.stdout or r.stderr)[-500:]})
 
         if action == "status":
             r = subprocess.run(
-                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--status"],
+                [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--status",
+                 "--config", str(CONFIG_PATH)],
                 capture_output=True, text=True, timeout=5,
             )
             if r.returncode == 0 and r.stdout.strip().startswith("socks5://"):
@@ -6054,7 +6057,8 @@ def api_tor():
 
         # action == "start"
         r = subprocess.run(
-            [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--start"],
+            [sys.executable, str(SCRIPT_DIR / "tor_helper.py"), "--start",
+             "--config", str(CONFIG_PATH)],
             capture_output=True, text=True, timeout=180,
         )
         proxy = r.stdout.strip()

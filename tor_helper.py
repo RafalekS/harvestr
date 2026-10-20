@@ -157,7 +157,18 @@ def main() -> int:
     ap.add_argument("--stop", action="store_true", help="Kill any running tor.exe")
     ap.add_argument("--status", action="store_true", help="Print proxy URL if Tor is reachable")
     ap.add_argument("--test", action="store_true", help="Start Tor + test Coomer reachability")
+    # Same --config convention webui.py uses (default=None -> SCRIPT_DIR/config.json).
+    # webui.py itself is commonly launched with --config pointing somewhere else
+    # entirely (e.g. a NAS share), and every subprocess.run([...,"tor_helper.py",...])
+    # call site in webui.py needs to forward ITS OWN --config here too, or this
+    # script reads/writes the wrong config.json and a tor_path set in Settings is
+    # silently ignored — confirmed real case, not hypothetical.
+    ap.add_argument("--config", default=None, help="Path to config.json (for tor_path)")
     args = ap.parse_args()
+
+    if args.config:
+        global CONFIG_PATH
+        CONFIG_PATH = Path(os.path.expandvars(os.path.expanduser(args.config)))
 
     if args.stop:
         print("stopping tor...", file=sys.stderr)
