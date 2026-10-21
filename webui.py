@@ -2647,6 +2647,16 @@ async function refreshStatus() {
 
     _logLines = s.log_tail || [];
     renderLog();
+
+    // Queue has no setInterval of its own — _start_next_queued() pops it
+    // server-side as each performer finishes, but the panel only ever
+    // re-fetched on page load or a manual drag/remove, so it went stale
+    // mid-run (user saw 22 "waiting to run" items hours after they'd all
+    // already been popped and run). Piggyback on this existing 2s poll.
+    try {
+      const q = await api('/api/queue');
+      renderQueue(q.queue || []);
+    } catch (e) { /* non-fatal */ }
   } catch (e) { console.error(e); }
 }
 
