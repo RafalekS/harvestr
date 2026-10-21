@@ -263,15 +263,6 @@
       "yt_dlp_extractor": "hotmovs",
       "supports_flat": true
     },
-    "camwhores_tv": {
-      "category": "adult",
-      "patterns": [
-        "https://camwhores.tv/models/{u}/"
-      ],
-      "yt_dlp_extractor": "generic",
-      "supports_flat": true,
-      "notes": "No dedicated yt-dlp extractor; relies on generic scraping. Only /models/ used (search/tags return unrelated videos)."
-    },
     "txxx": {
       "category": "adult",
       "patterns": [
@@ -301,15 +292,6 @@
     "yt_dlp_extractor": "generic",
     "supports_flat": false,
     "notes": "Search-results page listing. No dedicated yt-dlp extractor; generic fallback."
-  },
-    "pornhd3x": {
-      "category": "adult",
-      "patterns": [
-        "https://www.pornhd3x.tv/studio/{u}"
-      ],
-      "yt_dlp_extractor": "generic",
-      "supports_flat": false,
-      "notes": "No yt-dlp extractor. Studio pages work with plain requests; pornstar pages are Cloudflare-blocked. Username = studio slug (e.g. 'vixen'). Custom scraper: PornHD3X in custom_scrapers.py."
-    }
+  }
   }
 }

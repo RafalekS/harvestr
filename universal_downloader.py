@@ -1341,6 +1341,30 @@ class UniversalDownloader:
         # Limit length
         return name[:180] if len(name) > 180 else name
 
+    def _append_pornhd3x_url_list(self, v: VideoRef) -> None:
+        """pornhd3x.tv's player is now fully client-side JS (no stream URL
+        anywhere in the raw HTML — confirmed Oct 2026), so this scraper can
+        never resolve a download URL for it unattended. Instead of losing
+        the video entirely, append its movie page URL to a per-performer
+        text file the user can batch-paste through the MediaSuite browser
+        extension, which captures the real signed CDN URL from an actual
+        authenticated browser session (the only mechanism that still works
+        for this site)."""
+        try:
+            perf_dir = self.output_dir / v.performer
+            perf_dir.mkdir(parents=True, exist_ok=True)
+            list_path = perf_dir / "pornhd3x_urls.txt"
+            existing = set()
+            if list_path.exists():
+                existing = set(list_path.read_text(encoding="utf-8").splitlines())
+            if v.video_url in existing:
+                return
+            with open(list_path, "a", encoding="utf-8") as f:
+                f.write(v.video_url + "\n")
+            self.log.debug(f"  [pornhd3x] appended to {list_path}")
+        except Exception as e:
+            self.log.debug(f"  [pornhd3x] could not write url list: {e}")
+
     def _download_custom_mp4(self, v: VideoRef, out_path: Path,
                              progress_slot: Optional[int] = None) -> bool:
         """Download a direct MP4 URL. Tries aria2c first, falls back to curl
@@ -1651,6 +1675,8 @@ class UniversalDownloader:
                     # we retry on next run after a site-code update.
                     self.log.info(f"  EMBED-UNSUPPORTED: {v.site}/{v.video_id} "
                                   f"(all extractor tiers failed — site may need scraper update)")
+                    if v.site == "pornhd3x":
+                        self._append_pornhd3x_url_list(v)
                     return ("skip", v, None)
                 self.failed.record_failure(v, "stream extraction failed", 0)
                 self.log.warning(f"  FAIL extract: {v.site}/{v.video_id}: {v.title[:60]}")

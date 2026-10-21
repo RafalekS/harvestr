@@ -4485,7 +4485,41 @@ class PornHD3X(SiteScraper):
                 return False
 
         if not found:
-            self.log.debug(f"  [{self.NAME}] no stream found in {video.video_url}")
+            # Site redesign (confirmed Oct 2026): movie pages no longer embed
+            # the jwplayer setup() call or any .m3u8/.mp4 URL in the raw HTML
+            # at all — the player is populated by a client-side JS call after
+            # page load (same AJAX pattern already used for ad slots on this
+            # site), and a devtools-detector script actively wipes the page
+            # if DevTools are open. Plain-requests regex extraction can never
+            # see this data; fall back to the same embed_extractors tiered
+            # strategy (yt-dlp inline, then Playwright) already used above
+            # for the lulustream-embed case, but on the movie page itself.
+            try:
+                import embed_extractors
+                result = embed_extractors.extract_embed_stream(video.video_url, log=self.log)
+                if result and result.stream_url:
+                    video.stream_url = result.stream_url
+                    video.stream_kind = result.stream_kind
+                    video.stream_headers = result.headers or {
+                        "User-Agent": USER_AGENT,
+                        "Referer": self.BASE_URL + "/",
+                    }
+                    self.log.debug(f"  [{self.NAME}] via embed_extractors OK: {result.stream_url[:80]}")
+                    return True
+            except Exception as e:
+                self.log.debug(f"  [{self.NAME}] embed_extractors fallback error: {e}")
+            # Site now renders its player entirely client-side (confirmed: no
+            # .m3u8/.mp4 URL anywhere in the raw HTML, no jwplayer() setup
+            # call either — it's populated by a follow-up JS/AJAX call after
+            # page load, same pattern the site already uses for ad slots).
+            # A real browser session (e.g. the MediaSuite Brave extension,
+            # which captures the signed CDN URL from actual network traffic
+            # in the user's authenticated session) can still get this; a
+            # fully automated headless run generally can't. Mark
+            # needs_browser (skip, not permanent-fail) so the caller can log
+            # the page URL for manual handling instead of just losing it.
+            video.stream_kind = "needs_browser"
+            self.log.debug(f"  [{self.NAME}] no stream found in {video.video_url} (needs real browser session)")
             return False
 
         # Prefer m3u8 (adaptive quality) over mp4
