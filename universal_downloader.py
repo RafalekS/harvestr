@@ -204,6 +204,64 @@ USER_AGENT = (
 
 
 # ── Logging ───────────────────────────────────────────────────────────────────
+def sanitize_cookies_file(path: str, log: logging.Logger) -> None:
+    """Drop malformed rows from a Netscape cookies.txt before yt-dlp loads it.
+
+    Python's stdlib http.cookiejar (which yt-dlp's --cookies loading uses)
+    asserts that a cookie's "include subdomains" flag (TRUE/FALSE, column 2)
+    agrees with whether its domain starts with a leading dot. One row that
+    violates this (e.g. domain "uber.com" with the subdomain flag TRUE)
+    throws an "invalid Netscape format cookies file" error that aborts
+    loading the WHOLE file — every site's downloads fail at once, not just
+    the one bad cookie's site. Confirmed real: a single stray "uber.com"
+    row (irrelevant to any site actually being downloaded) broke cookie
+    auth for every yt-dlp-based site in one run.
+
+    Re-exporting the cookies file by hand fixes it until the next export
+    introduces a new bad row, so this runs on every launch instead."""
+    if not path:
+        return
+    p = Path(path)
+    if not p.is_file():
+        return
+    try:
+        raw = p.read_bytes()
+    except OSError as e:
+        log.warning(f"cookies: could not read {path} to sanitize: {e}")
+        return
+
+    lines = raw.decode("utf-8", errors="replace").splitlines()
+    kept, dropped = [], []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            kept.append(line)
+            continue
+        fields = line.split("\t")
+        if len(fields) != 7:
+            dropped.append(line)
+            continue
+        domain, include_sub, _path, _secure, _expiry, _name, _value = fields
+        initial_dot = domain.startswith(".")
+        domain_specified = (include_sub == "TRUE")
+        if initial_dot != domain_specified:
+            dropped.append(line)
+            continue
+        kept.append(line)
+
+    if not dropped:
+        return
+
+    try:
+        p.write_text("\n".join(kept) + "\n", encoding="utf-8")
+    except OSError as e:
+        log.warning(f"cookies: found {len(dropped)} malformed row(s) but could not rewrite {path}: {e}")
+        return
+    for line in dropped:
+        log.warning(f"cookies: dropped malformed row from {p.name}: {line[:120]}")
+    log.warning(f"cookies: sanitized {p.name} — removed {len(dropped)} malformed row(s), {len(kept)} kept")
+
+
 def setup_logging(log_dir: Path, verbose: bool = False) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     log_file = log_dir / "universal.log"
@@ -2048,6 +2106,7 @@ def main() -> int:
         return 0
 
     log = setup_logging(Path(cfg.output_dir), verbose=cfg.verbose)
+    sanitize_cookies_file(cfg.cookies_file, log)
 
     if HAVE_RICH:
         engine_info = f"aria2c: {'yes' if ARIA2C_PATH else 'no'} | ffmpeg: {'yes' if FFMPEG_PATH else 'no'}"
