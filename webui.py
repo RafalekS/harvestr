@@ -5037,8 +5037,16 @@ def _runs_parse():
         with _runs_lock:
             offset = _runs_data.get("offset", 0)
             perfs = dict(_runs_data.get("performers", {}))
-        if size < offset:          # log truncated/replaced -> full reparse
-            offset, perfs = 0, {}
+        if size < offset:
+            # Log truncated/rotated (manual cleanup, or RotatingFileHandler
+            # rolling over) -> re-read from byte 0 of the new file, but keep
+            # the already-parsed performers dict. It holds derived summary
+            # data (run counts/timestamps), not raw log text, so there's
+            # nothing to invalidate just because the log file got smaller.
+            # A prior version reset perfs={} here too, which silently wiped
+            # every performer's entire run history the moment universal.log
+            # was truncated — confirmed real: 382 performers' history lost.
+            offset = 0
         if size <= offset:
             return
         with open(LOG_PATH, "rb") as f:
